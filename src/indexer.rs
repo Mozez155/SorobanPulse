@@ -436,7 +436,14 @@ impl<R: RpcClient> Indexer<R> {
                     contract_id = %event.contract_id,
                     ledger = event.ledger,
                     event_type = %event.event_type,
-                    value_type = event.value.type_str(),
+                    value_type = match &event.value {
+                        serde_json::Value::Null => "null",
+                        serde_json::Value::Bool(_) => "bool",
+                        serde_json::Value::Number(_) => "number",
+                        serde_json::Value::String(_) => "string",
+                        serde_json::Value::Array(_) => "array",
+                        serde_json::Value::Object(_) => "object",
+                    },
                     "Invalid event_data.value: expected object or null",
                 );
                 metrics::record_validation_failure();
@@ -444,22 +451,8 @@ impl<R: RpcClient> Indexer<R> {
             }
         }
 
-        // Validate that topic is an array or null
-        match &event.topic {
-            Some(serde_json::Value::Array(_)) | None => {}
-            Some(other) => {
-                warn!(
-                    tx_hash = %event.tx_hash,
-                    contract_id = %event.contract_id,
-                    ledger = event.ledger,
-                    event_type = %event.event_type,
-                    topic_type = other.type_str(),
-                    "Invalid event_data.topic: expected array or null",
-                );
-                metrics::record_validation_failure();
-                return false;
-            }
-        }
+        // topic is Option<Vec<Value>> — always valid (None or a Vec)
+        let _ = &event.topic;
 
         true
     }
