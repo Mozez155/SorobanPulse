@@ -66,8 +66,8 @@ pub async fn cache_middleware(
     req: Request,
     next: Next,
 ) -> Response {
-    let path = req.uri().path();
-    let query = req.uri.query().unwrap_or("");
+    let path = req.uri().path().to_owned();
+    let query = req.uri().query().unwrap_or("").to_owned();
     
     let mut response = next.run(req).await;
     
@@ -98,25 +98,24 @@ pub async fn cache_middleware(
     );
     
     // Add ETag header based on response body hash
-    if let Ok(body_bytes) = axum::body::to_bytes(response.into_body(), usize::MAX).await {
+    let (mut parts, body) = response.into_parts();
+    parts.headers.insert(
+        "Cache-Control",
+        cache_control.parse().unwrap_or_else(|_| "no-cache".parse().unwrap()),
+    );
+    if let Ok(body_bytes) = axum::body::to_bytes(body, usize::MAX).await {
         let mut hasher = Sha256::new();
         hasher.update(&body_bytes);
         let hash = format!("{:x}", hasher.finalize());
-        let etag = format!("\"{}\"", &hash[..16]); // Use first 16 chars of hash
-        
-        let mut new_response = Response::new(axum::body::Body::from(body_bytes));
-        *new_response.status_mut() = response.status();
-        *new_response.headers_mut() = response.headers().clone();
-        
-        new_response.headers_mut().insert(
+        let etag = format!("\"{}\"", &hash[..16]);
+        parts.headers.insert(
             "ETag",
             etag.parse().unwrap_or_else(|_| "\"unknown\"".parse().unwrap()),
         );
-        
-        return new_response;
+        Response::from_parts(parts, axum::body::Body::from(body_bytes))
+    } else {
+        Response::from_parts(parts, axum::body::Body::empty())
     }
-    
-    response
 }
 
 #[cfg(test)]

@@ -13,6 +13,7 @@ mod indexer;
 mod metrics;
 mod middleware;
 mod models;
+mod pruner;
 mod routes;
 mod rpc_client;
 
@@ -126,12 +127,21 @@ async fn main() -> anyhow::Result<()> {
 
     // Spawn background indexer with health state
     let rpc_client = indexer::SorobanRpcClient::new(&config);
+    let pruner_shutdown_rx = shutdown_rx.clone();
     let mut indexer = indexer::Indexer::new(pool.clone(), config.clone(), shutdown_rx, rpc_client);
     indexer.set_health_state(health_state.clone());
     indexer.set_indexer_state(indexer_state.clone());
     indexer.set_event_tx(event_tx.clone());
     let indexer_handle = tokio::spawn(async move {
         indexer.run().await;
+    });
+
+    // Spawn background event pruner (disabled when EVENT_RETENTION_DAYS=0)
+    let pruner_pool = pool.clone();
+    let pruner_retention_days = config.event_retention_days;
+    let pruner_interval_hours = config.pruning_interval_hours;
+    tokio::spawn(async move {
+        pruner::run_pruner(pruner_pool, pruner_retention_days, pruner_interval_hours, pruner_shutdown_rx).await;
     });
 
     async fn shutdown_signal() {
@@ -166,7 +176,7 @@ async fn main() -> anyhow::Result<()> {
     let addr = SocketAddr::from(([0, 0, 0, 0], config.port));
     info!(origins = ?config.allowed_origins, "Allowed CORS origins");
     info!(rate_limit = config.rate_limit_per_minute, "Rate limit per IP");
-    let router = routes::create_router_with_tx(pool, config.api_keys.clone(), &config.allowed_origins, config.rate_limit_per_minute, config.behind_proxy, health_state, indexer_state, prometheus_handle, event_tx, config.sse_keepalive_interval_ms);
+    let router = routes::create_router_with_tx(pool, config.api_keys.clone(), &config.allowed_origins, config.rate_limit_per_minute, config.behind_proxy, health_state, indexer_state, prometheus_handle, event_tx, config.sse_keepalive_interval_ms, config.sse_max_connections, 2000);
 
     info!(addr = %addr, "Soroban Pulse listening");
 
