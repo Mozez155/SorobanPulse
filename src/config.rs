@@ -132,6 +132,8 @@ pub struct Config {
     pub sse_max_connections: usize,
     pub environment: Environment,
     pub max_body_size_bytes: usize,
+    pub event_retention_days: u64,
+    pub pruning_interval_hours: u64,
 }
 
 impl Default for Config {
@@ -159,6 +161,8 @@ impl Default for Config {
             sse_max_connections: 1000,
             environment: Environment::Development,
             max_body_size_bytes: 1024 * 1024, // 1 MB default
+            event_retention_days: 90,
+            pruning_interval_hours: 24,
         }
     }
 }
@@ -374,6 +378,14 @@ impl Config {
                 .unwrap_or_else(|_| (1024 * 1024).to_string())
                 .parse()
                 .expect("MAX_BODY_SIZE_BYTES must be a number"),
+            event_retention_days: env::var("EVENT_RETENTION_DAYS")
+                .unwrap_or_else(|_| "90".to_string())
+                .parse()
+                .expect("EVENT_RETENTION_DAYS must be a non-negative integer"),
+            pruning_interval_hours: env::var("PRUNING_INTERVAL_HOURS")
+                .unwrap_or_else(|_| "24".to_string())
+                .parse()
+                .expect("PRUNING_INTERVAL_HOURS must be a positive integer"),
         }
     }
 }
