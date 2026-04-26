@@ -54,7 +54,7 @@ pub async fn set_query_timeout(
     timeout_ms: u64,
 ) -> Result<(), sqlx::Error> {
     sqlx::query(&format!("SET LOCAL statement_timeout = '{timeout_ms}ms'"))
-        .execute(&mut **conn)
+        .execute(&mut *conn)
         .await
         .map(|_| ())
 }

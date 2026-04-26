@@ -52,6 +52,22 @@ pub fn update_sse_connections(count: usize) {
     m::gauge!("soroban_pulse_sse_connections_active", count as f64);
 }
 
+/// Update DB connection pool metrics
+pub fn update_db_pool_metrics(pool: &PgPool) {
+    m::gauge!("soroban_pulse_db_pool_size", pool.size() as f64);
+    m::gauge!("soroban_pulse_db_pool_idle", pool.num_idle() as f64);
+}
+
+/// Record events pruned by the retention job
+pub fn record_events_pruned(count: u64) {
+    m::counter!("soroban_pulse_events_pruned_total", count);
+}
+
+/// Record a duplicate event (skipped on insert)
+pub fn record_duplicate_event() {
+    m::counter!("soroban_pulse_events_duplicate_total", 1u64);
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
