@@ -2332,6 +2332,67 @@ pub async fn resume_indexer(
     Ok(Json(json!({ "indexer_paused": false })))
 }
 
+/// Start a background re-encryption job to migrate events from old key to new key.
+#[utoipa::path(
+    post,
+    path = "/v1/admin/reencrypt",
+    tag = "admin",
+    responses(
+        (status = 202, description = "Re-encryption job started"),
+        (status = 400, description = "Encryption not enabled or no old key configured", body = ErrorResponse),
+        (status = 409, description = "Re-encryption job already running", body = ErrorResponse),
+        (status = 401, description = "Unauthorized", body = ErrorResponse),
+    )
+)]
+pub async fn start_reencrypt(
+    State(state): State<AppState>,
+) -> Result<(StatusCode, Json<Value>), (StatusCode, Json<Value>)> {
+    #[cfg(not(feature = "encryption"))]
+    {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(json!({ "error": "encryption feature not enabled" })),
+        ));
+    }
+
+    #[cfg(feature = "encryption")]
+    {
+        let new_key = state.encryption_key.ok_or((
+            StatusCode::BAD_REQUEST,
+            Json(json!({ "error": "ENCRYPTION_KEY not configured" })),
+        ))?;
+
+        let old_key = state.encryption_key_old.ok_or((
+            StatusCode::BAD_REQUEST,
+            Json(json!({ "error": "ENCRYPTION_KEY_OLD not configured" })),
+        ))?;
+
+        // Create or get the reencrypt state from app state
+        // For now, we'll create a new one per request (in production, store in AppState)
+        let reencrypt_state = crate::reencrypt::ReencryptState::new();
+
+        if reencrypt_state.is_running() {
+            return Err((
+                StatusCode::CONFLICT,
+                Json(json!({ "error": "re-encryption job already running" })),
+            ));
+        }
+
+        let pool = state.pool.clone();
+        let batch_size = 1000;
+
+        crate::reencrypt::start_reencrypt_job(pool, new_key, old_key, batch_size, reencrypt_state);
+
+        Ok((
+            StatusCode::ACCEPTED,
+            Json(json!({
+                "message": "re-encryption job started",
+                "batch_size": batch_size
+            })),
+        ))
+    }
+}
+
 #[utoipa::path(
     get,
     path = "/v1/events/diff",

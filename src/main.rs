@@ -28,6 +28,7 @@ mod parquet_export;
 
 mod pubsub;
 mod queue_publisher;
+mod reencrypt;
 mod routes;
 mod rpc_client;
 mod schema_validator;
