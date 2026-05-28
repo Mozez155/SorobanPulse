@@ -6,6 +6,9 @@
 //! They use the `MockRpcClient` from the indexer module to simulate network failures
 //! without requiring Docker or toxiproxy, making them runnable in standard CI.
 
+mod test_helpers;
+use test_helpers::wait_for;
+
 use soroban_pulse::config::{Config, HealthState, IndexerState};
 use soroban_pulse::indexer::{Indexer, RpcClient};
 use soroban_pulse::models::{GetEventsResult, SorobanEvent};
@@ -268,8 +271,26 @@ async fn health_reports_degraded_when_indexer_stalled(pool: PgPool) {
         config,
     );
 
-    // Wait just over the stall threshold.
-    tokio::time::sleep(Duration::from_secs(2)).await;
+    // Wait for the stall threshold to be exceeded using polling instead of fixed sleep
+    wait_for(
+        || async {
+            let response = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .uri("/healthz/ready")
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            response.status() == StatusCode::SERVICE_UNAVAILABLE
+        },
+        Duration::from_secs(30),
+        Duration::from_millis(100),
+    )
+    .await
+    .expect("Health endpoint should report degraded status");
 
     let response = app
         .oneshot(
