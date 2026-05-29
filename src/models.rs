@@ -83,6 +83,8 @@ pub struct PaginationParams {
     /// Sort column: `ledger`, `timestamp`, or `created_at` (default: ledger)
     pub sort_by: Option<SortBy>,
     pub in_successful_call: Option<bool>,
+    /// Filter by Soroban protocol schema version.
+    pub schema_version: Option<i32>,
     /// Filter by the first topic symbol (uses topic_0_sym generated column index).
     pub topic_sym: Option<String>,
     /// Filter by topic array using JSONB containment (e.g., ?topic=["transfer"]).
@@ -299,6 +301,39 @@ pub struct ReplayRequest {
 pub struct BatchTxRequest {
     /// List of transaction hashes to look up (max 100).
     pub hashes: Vec<String>,
+}
+
+/// Request body for bulk event insertion.
+#[derive(Debug, Deserialize, utoipa::ToSchema)]
+pub struct BulkInsertRequest {
+    /// List of events to insert (max 1000 per request).
+    pub events: Vec<BulkEventInput>,
+}
+
+/// Event input for bulk insertion.
+#[derive(Debug, Deserialize, utoipa::ToSchema)]
+pub struct BulkEventInput {
+    pub contract_id: String,
+    pub event_type: String,
+    pub tx_hash: String,
+    pub ledger: i64,
+    pub timestamp: DateTime<Utc>,
+    pub event_data: Value,
+    #[serde(default)]
+    pub event_data_normalized: Option<Value>,
+    #[serde(default)]
+    pub ledger_hash: Option<String>,
+    #[serde(default)]
+    pub in_successful_call: Option<bool>,
+}
+
+/// Response for bulk event insertion.
+#[derive(Debug, Serialize, utoipa::ToSchema)]
+pub struct BulkInsertResponse {
+    pub inserted: i64,
+    pub skipped: i64,
+    pub failed: i64,
+    pub errors: Vec<String>,
 }
 
 #[derive(Debug, Serialize, sqlx::FromRow, utoipa::ToSchema)]

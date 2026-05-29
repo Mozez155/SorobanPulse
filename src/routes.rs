@@ -315,6 +315,10 @@ pub fn create_router_with_tx_and_tenant_map(
             "/events/tx/batch",
             axum::routing::post(handlers::get_events_by_tx_batch),
         )
+        .route(
+            "/admin/events/bulk",
+            axum::routing::post(handlers::bulk_insert_events),
+        )
         .route("/events/tx/{tx_hash}", get(handlers::get_events_by_tx))
         .route(
             "/events/ledger-hash/{hash}",
@@ -327,6 +331,7 @@ pub fn create_router_with_tx_and_tenant_map(
         .route("/admin/mask-events/{job_id}", get(handlers::get_mask_job_status))
         .route("/admin/contracts/{contract_id}/abi", axum::routing::post(handlers::register_contract_abi))
         .route("/admin/events/{id}/anonymize", axum::routing::post(handlers::anonymize_event))
+        .route("/admin/events/contract/{contract_id}", axum::routing::delete(handlers::delete_contract_events))
         .route("/admin/indexer/pause", axum::routing::post(handlers::pause_indexer))
         .route("/admin/indexer/resume", axum::routing::post(handlers::resume_indexer))
         .route("/admin/contracts/{contract_id}/schema", axum::routing::post(handlers::register_contract_schema).get(handlers::get_contract_schema).delete(handlers::delete_contract_schema))

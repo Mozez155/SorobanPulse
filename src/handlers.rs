@@ -18,6 +18,7 @@ use std::convert::Infallible;
 use std::sync::OnceLock;
 use std::time::Duration;
 use tokio::sync::Mutex;
+use tracing::{info_span, instrument};
 use uuid::Uuid;
 
 use crate::{
@@ -602,6 +603,7 @@ pub async fn swagger_ui() -> impl IntoResponse {
         (status = 503, description = "Too many SSE connections", body = ErrorResponse),
     )
 )]
+#[instrument(skip(state, headers, extensions), fields(contract_id = ?params.contract_id))]
 pub async fn stream_events(
     State(state): State<AppState>,
     Query(params): Query<StreamParams>,
@@ -662,6 +664,7 @@ pub async fn stream_events_by_contract(
         (status = 503, description = "Too many SSE connections", body = ErrorResponse),
     )
 )]
+#[instrument(skip(state, headers, extensions), fields(contract_ids = ?params.contract_ids))]
 pub async fn stream_events_multi(
     State(state): State<AppState>,
     Query(params): Query<crate::models::MultiStreamParams>,
@@ -1260,7 +1263,7 @@ fn ndjson_response(events: impl Iterator<Item = Value>) -> Response<Body> {
         (status = 400, description = "Invalid query parameters"),
     )
 )]
-
+#[instrument(skip(state, headers, extensions), fields(page = ?params.page, limit = ?params.limit, contract_id = ?params.contract_id))]
 pub async fn get_events(
     State(state): State<AppState>,
     Query(params): Query<PaginationParams>,
@@ -1385,6 +1388,10 @@ pub async fn get_events(
             conditions.push(format!("in_successful_call = ${bind_idx}"));
             bind_idx += 1;
         }
+        if params.schema_version.is_some() {
+            conditions.push(format!("schema_version = ${bind_idx}"));
+            bind_idx += 1;
+        }
         if params.topic_sym.is_some() {
             conditions.push(format!("topic_0_sym = ${bind_idx}"));
             bind_idx += 1;
@@ -1476,6 +1483,9 @@ pub async fn get_events(
         if let Some(isc) = params.in_successful_call {
             q = q.bind(isc);
         }
+        if let Some(sv) = params.schema_version {
+            q = q.bind(sv);
+        }
         if let Some(ref ts) = params.topic_sym {
             q = q.bind(ts);
         }
@@ -1496,7 +1506,9 @@ pub async fn get_events(
         }
         q = q.bind(limit);
 
+        let _db_span = info_span!("db_query", query_type = "get_events_cursor").entered();
         let rows = q.fetch_all(&state.read_pool).await?;
+        drop(_db_span);
 
         let has_more = rows.len() as i64 == limit;
         let next_cursor = if has_more {
@@ -1618,6 +1630,10 @@ pub async fn get_events(
         conditions.push(format!("in_successful_call = ${bind_idx}"));
         bind_idx += 1;
     }
+    if params.schema_version.is_some() {
+        conditions.push(format!("schema_version = ${bind_idx}"));
+        bind_idx += 1;
+    }
     if params.topic_sym.is_some() {
         conditions.push(format!("topic_0_sym = ${bind_idx}"));
         bind_idx += 1;
@@ -1699,6 +1715,9 @@ pub async fn get_events(
     if let Some(isc) = params.in_successful_call {
         q = q.bind(isc);
     }
+    if let Some(sv) = params.schema_version {
+        q = q.bind(sv);
+    }
     if let Some(ref ts) = params.topic_sym {
         q = q.bind(ts);
     }
@@ -1719,7 +1738,9 @@ pub async fn get_events(
     }
     q = q.bind(limit).bind(offset);
 
+    let _db_span = info_span!("db_query", query_type = "get_events_offset").entered();
     let rows = q.fetch_all(&state.read_pool).await?;
+    drop(_db_span);
 
     let has_more = rows.len() as i64 == limit;
     let next_cursor = if has_more {
@@ -1792,7 +1813,9 @@ pub async fn get_events(
         if let Some(tid) = tenant_id {
             cq = cq.bind(tid);
         }
+        let _count_span = info_span!("db_query", query_type = "count_events").entered();
         let count = cq.fetch_one(&state.read_pool).await?;
+        drop(_count_span);
         (count, false)
     } else {
         // In multi-tenant mode we can't use the pg_class estimate (it's for the whole table).
@@ -1887,20 +1910,41 @@ pub async fn get_events(
     Ok(response)
 }
 
+/// Escape a single CSV field per RFC 4180.
+///
+/// A field is wrapped in double-quotes if it contains a comma, double-quote,
+/// newline (`\n`), or carriage-return (`\r`). Any double-quote character
+/// inside the field is escaped by doubling it (`"` → `""`).
+fn csv_escape_field(value: &str) -> String {
+    if value.contains([',', '"', '\n', '\r']) {
+        // Escape embedded double-quotes by doubling them, then wrap in quotes.
+        let escaped = value.replace('"', "\"\"");
+        format!("\"{escaped}\"")
+    } else {
+        value.to_owned()
+    }
+}
+
 #[utoipa::path(
     get,
     path = "/v1/events/export",
     tag = "events",
     params(
-        ("format" = Option<String>, Query, description = "Output format: csv (default) or parquet"),
+        ("format" = Option<String>, Query, description = "Output format: `csv` (default) or `parquet`. \
+            CSV output streams RFC 4180-compliant text with a header row. \
+            Parquet output requires the `parquet` feature flag."),
         ("event_type" = Option<String>, Query, description = "Filter by event type: contract, diagnostic, system"),
         ("from_ledger" = Option<i64>, Query, description = "Return events at or after this ledger"),
         ("to_ledger" = Option<i64>, Query, description = "Return events at or before this ledger"),
         ("contract_id" = Option<String>, Query, description = "Filter by contract ID"),
     ),
     responses(
-        (status = 200, description = "Exported events (CSV, Parquet, or JSON Lines depending on format param)"),
-        (status = 400, description = "Invalid query parameters"),
+        (status = 200, description = "Exported events. \
+            CSV: `Content-Type: text/csv`, header row `id,contract_id,event_type,tx_hash,ledger,timestamp,event_data,created_at`, \
+            streamed with `Content-Disposition: attachment; filename=\"events.csv\"`. \
+            Parquet: `Content-Type: application/octet-stream`, \
+            `Content-Disposition: attachment; filename=\"events.parquet\"`."),
+        (status = 400, description = "Invalid query parameters or unsupported format"),
         (status = 401, description = "API key required"),
     )
 )]
@@ -1922,8 +1966,15 @@ pub async fn export_events(
         }
     }
 
-    let want_parquet = params.format.as_deref() == Some("parquet");
-    let want_jsonl = params.format.as_deref() == Some("jsonl");
+    let fmt = params.format.as_deref().unwrap_or("csv");
+    let want_parquet = fmt == "parquet";
+    let want_csv = fmt == "csv" || fmt.is_empty();
+
+    if !want_parquet && !want_csv {
+        return Err(AppError::Validation(format!(
+            "unsupported format '{fmt}': use 'csv' or 'parquet'"
+        )));
+    }
 
     #[cfg(not(feature = "parquet"))]
     if want_parquet {
@@ -2078,9 +2129,20 @@ pub async fn export_events(
             .unwrap());
     }
 
-    // Default: CSV
-    let mut csv =
-        String::from("id,contract_id,event_type,tx_hash,ledger,timestamp,event_data,created_at\n");
+    // Default: CSV (RFC 4180)
+    // Build each row as a Bytes chunk and stream them so the full result set
+    // is never held in a single allocation.
+    use bytes::Bytes;
+    use futures::stream;
+
+    const CSV_HEADER: &str =
+        "id,contract_id,event_type,tx_hash,ledger,timestamp,event_data,created_at\n";
+
+    // Collect row chunks; the header is the first chunk.
+    let mut chunks: Vec<Result<Bytes, std::convert::Infallible>> =
+        Vec::with_capacity(rows.len() + 1);
+    chunks.push(Ok(Bytes::from_static(CSV_HEADER.as_bytes())));
+
     for row in &rows {
         let id: uuid::Uuid = row.try_get("id")?;
         let contract_id: String = row.try_get("contract_id")?;
@@ -2090,10 +2152,22 @@ pub async fn export_events(
         let timestamp: chrono::DateTime<chrono::Utc> = row.try_get("timestamp")?;
         let event_data: serde_json::Value = row.try_get("event_data")?;
         let created_at: chrono::DateTime<chrono::Utc> = row.try_get("created_at")?;
-        let data_str = event_data.to_string().replace('"', "\"\"");
-        csv.push_str(&format!(
-            "{id},{contract_id},{event_type},{tx_hash},{ledger},{timestamp},\"{data_str}\",{created_at}\n"
-        ));
+
+        // Serialize event_data to a JSON string, then escape it as a CSV field.
+        let data_str = event_data.to_string();
+
+        let line = format!(
+            "{},{},{},{},{},{},{},{}\n",
+            csv_escape_field(&id.to_string()),
+            csv_escape_field(&contract_id),
+            csv_escape_field(&event_type),
+            csv_escape_field(&tx_hash),
+            ledger,
+            csv_escape_field(&timestamp.to_rfc3339()),
+            csv_escape_field(&data_str),
+            csv_escape_field(&created_at.to_rfc3339()),
+        );
+        chunks.push(Ok(Bytes::from(line)));
     }
 
     Ok(Response::builder()
@@ -2104,7 +2178,7 @@ pub async fn export_events(
             "attachment; filename=\"events.csv\"",
         )
         .header("Content-Range", content_range)
-        .body(Body::from(csv))
+        .body(Body::from_stream(stream::iter(chunks)))
         .unwrap())
 }
 
@@ -2114,6 +2188,8 @@ pub struct RecentParams {
     pub limit: Option<i64>,
     pub event_type: Option<crate::models::EventType>,
     pub contract_id: Option<String>,
+    /// Cursor for pagination (opaque, URL-safe).
+    pub cursor: Option<String>,
     /// Not supported — returns 400 if provided.
     pub from_ledger: Option<i64>,
     /// Not supported — returns 400 if provided.
@@ -2128,6 +2204,7 @@ pub struct RecentParams {
         ("limit" = Option<i64>, Query, description = "Number of most-recent events to return, 1–100 (default: 20)"),
         ("event_type" = Option<crate::models::EventType>, Query, description = "Filter by event type: contract, diagnostic, system"),
         ("contract_id" = Option<String>, Query, description = "Filter by contract ID"),
+        ("cursor" = Option<String>, Query, description = "Cursor for pagination (opaque, URL-safe)"),
     ),
     responses(
         (status = 200, description = "Most recently indexed events in descending ledger order"),
@@ -2161,6 +2238,16 @@ pub async fn get_recent_events(
         bind_idx += 1;
     }
 
+    // Handle cursor-based pagination
+    if let Some(ref cursor_str) = params.cursor {
+        let (cursor_ledger, cursor_id) = decode_cursor(cursor_str)?;
+        conditions.push(format!(
+            "(ledger, id) < (${}, ${})",
+            bind_idx, bind_idx + 1
+        ));
+        bind_idx += 2;
+    }
+
     let where_clause = if conditions.is_empty() {
         String::new()
     } else {
@@ -2180,9 +2267,21 @@ pub async fn get_recent_events(
     if let Some(ref et) = params.event_type {
         q = q.bind(et);
     }
-    q = q.bind(limit);
+    if let Some(ref cursor_str) = params.cursor {
+        let (cursor_ledger, cursor_id) = decode_cursor(cursor_str)?;
+        q = q.bind(cursor_ledger);
+        q = q.bind(cursor_id);
+    }
+    q = q.bind(limit + 1); // Fetch one extra to determine if there's a next page
 
     let rows = q.fetch_all(&state.pool).await?;
+    let has_next = rows.len() > limit as usize;
+    let rows = if has_next {
+        &rows[..limit as usize]
+    } else {
+        &rows
+    };
+
     let events: Vec<Value> = rows
         .iter()
         .map(|e| {
@@ -2195,10 +2294,18 @@ pub async fn get_recent_events(
         })
         .collect();
 
-    Ok(Json(json!({
+    let mut response = json!({
         "data": events,
         "limit": limit,
-    })))
+    });
+
+    if has_next && !rows.is_empty() {
+        let last_event = &rows[rows.len() - 1];
+        let next_cursor = encode_cursor(last_event.ledger, last_event.id);
+        response["next_cursor"] = json!(next_cursor);
+    }
+
+    Ok(Json(response))
 }
 
 #[utoipa::path(
@@ -2223,6 +2330,7 @@ pub async fn get_recent_events(
         (status = 500, description = "Internal server error", body = ErrorResponse),
     )
 )]
+#[instrument(skip(state, extensions), fields(contract_id = %contract_id))]
 pub async fn get_events_by_contract(
     State(state): State<AppState>,
     Path(contract_id): Path<String>,
@@ -2380,6 +2488,7 @@ pub async fn get_events_by_contract(
         (status = 500, description = "Internal server error", body = ErrorResponse),
     )
 )]
+#[instrument(skip(state, extensions), fields(tx_hash = %tx_hash))]
 pub async fn get_events_by_tx(
     State(state): State<AppState>,
     Path(tx_hash): Path<String>,
@@ -2443,6 +2552,109 @@ pub async fn get_events_by_tx(
     responses(
         (status = 200, description = "Map of tx_hash -> events for all requested hashes"),
         (status = 400, description = "Invalid hashes or too many hashes", body = ErrorResponse),
+        (status = 401, description = "Unauthorized", body = ErrorResponse),
+        (status = 429, description = "Too many requests", body = ErrorResponse),
+        (status = 500, description = "Internal server error", body = ErrorResponse),
+    )
+)]
+#[instrument(skip(state, body))]
+pub async fn bulk_insert_events(
+    State(state): State<AppState>,
+    Json(body): Json<crate::models::BulkInsertRequest>,
+) -> Result<Json<crate::models::BulkInsertResponse>, AppError> {
+    const MAX_BATCH_SIZE: usize = 1000;
+    
+    if body.events.is_empty() {
+        return Err(AppError::Validation("events list cannot be empty".to_string()));
+    }
+    
+    if body.events.len() > MAX_BATCH_SIZE {
+        return Err(AppError::Validation(format!(
+            "events list exceeds maximum of {} events",
+            MAX_BATCH_SIZE
+        )));
+    }
+    
+    let mut inserted = 0i64;
+    let mut skipped = 0i64;
+    let mut failed = 0i64;
+    let mut errors = Vec::new();
+    
+    for event in body.events {
+        // Validate contract_id
+        if let Err(e) = validate_contract_id(&event.contract_id) {
+            failed += 1;
+            errors.push(format!("Invalid contract_id: {}", e));
+            continue;
+        }
+        
+        // Validate tx_hash
+        if let Err(e) = validate_tx_hash(&event.tx_hash) {
+            failed += 1;
+            errors.push(format!("Invalid tx_hash: {}", e));
+            continue;
+        }
+        
+        // Validate event_type
+        let event_type = match event.event_type.as_str() {
+            "contract" | "diagnostic" | "system" => event.event_type.clone(),
+            _ => {
+                failed += 1;
+                errors.push(format!("Invalid event_type: {}", event.event_type));
+                continue;
+            }
+        };
+        
+        let id = Uuid::new_v4();
+        let result = sqlx::query(
+            "INSERT INTO events (id, contract_id, event_type, tx_hash, ledger, timestamp, event_data, event_data_normalized, ledger_hash, in_successful_call, created_at)
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, NOW())
+             ON CONFLICT (contract_id, tx_hash, ledger, event_type) DO NOTHING"
+        )
+        .bind(id)
+        .bind(&event.contract_id)
+        .bind(&event_type)
+        .bind(&event.tx_hash)
+        .bind(event.ledger)
+        .bind(event.timestamp)
+        .bind(&event.event_data)
+        .bind(&event.event_data_normalized)
+        .bind(&event.ledger_hash)
+        .bind(event.in_successful_call.unwrap_or(false))
+        .execute(&state.write_pool)
+        .await;
+        
+        match result {
+            Ok(result) => {
+                if result.rows_affected() > 0 {
+                    inserted += 1;
+                } else {
+                    skipped += 1;
+                }
+            }
+            Err(e) => {
+                failed += 1;
+                errors.push(format!("Database error: {}", e));
+            }
+        }
+    }
+    
+    Ok(Json(crate::models::BulkInsertResponse {
+        inserted,
+        skipped,
+        failed,
+        errors,
+    }))
+}
+
+#[utoipa::path(
+    post,
+    path = "/v1/admin/events/bulk",
+    tag = "Admin",
+    request_body = crate::models::BulkInsertRequest,
+    responses(
+        (status = 200, description = "Bulk insert result", body = crate::models::BulkInsertResponse),
+        (status = 400, description = "Invalid request", body = ErrorResponse),
         (status = 401, description = "Unauthorized", body = ErrorResponse),
         (status = 429, description = "Too many requests", body = ErrorResponse),
         (status = 500, description = "Internal server error", body = ErrorResponse),
@@ -2670,6 +2882,111 @@ pub async fn anonymize_event(
     tracing::info!(event_id = %id, anonymized_at = %chrono::Utc::now(), "Event anonymized");
 
     Ok(Json(json!({ "id": id, "anonymized": true })))
+}
+
+/// Delete all events for a contract (GDPR right-to-erasure).
+/// Optionally anonymize instead of deleting with `anonymize_only=true`.
+/// Logs deletion request for audit purposes.
+#[utoipa::path(
+    delete,
+    path = "/v1/admin/events/contract/{contract_id}",
+    tag = "admin",
+    params(
+        ("contract_id" = String, Path, description = "Contract ID"),
+        ("anonymize_only" = Option<bool>, Query, description = "If true, anonymize instead of deleting (default: false)"),
+    ),
+    responses(
+        (status = 200, description = "Events deleted or anonymized"),
+        (status = 400, description = "Invalid contract_id", body = ErrorResponse),
+        (status = 401, description = "Unauthorized", body = ErrorResponse),
+    )
+)]
+pub async fn delete_contract_events(
+    State(state): State<AppState>,
+    Path(contract_id): Path<String>,
+    axum::extract::Query(params): axum::extract::Query<std::collections::HashMap<String, String>>,
+    headers: axum::http::HeaderMap,
+) -> Result<Json<Value>, AppError> {
+    validate_contract_id(&contract_id)?;
+
+    let anonymize_only = params
+        .get("anonymize_only")
+        .and_then(|v| v.parse::<bool>().ok())
+        .unwrap_or(false);
+
+    let client_ip = headers
+        .get("x-forwarded-for")
+        .and_then(|h| h.to_str().ok())
+        .unwrap_or("unknown");
+
+    if anonymize_only {
+        // Anonymize: set anonymized=true and hash tx_hash
+        use sha2::{Digest, Sha256};
+
+        let rows = sqlx::query("SELECT id, tx_hash FROM events WHERE contract_id = $1 AND anonymized = FALSE")
+            .bind(&contract_id)
+            .fetch_all(&state.pool)
+            .await?;
+
+        let count = rows.len() as u64;
+
+        for row in rows {
+            let id: Uuid = row.try_get("id")?;
+            let tx_hash: String = row.try_get("tx_hash")?;
+            let hashed_tx = {
+                let mut h = Sha256::new();
+                h.update(tx_hash.as_bytes());
+                format!("{:x}", h.finalize())
+            };
+
+            sqlx::query("UPDATE events SET anonymized = TRUE, event_data = $1, tx_hash = $2 WHERE id = $3")
+                .bind(json!({"anonymized": true}))
+                .bind(&hashed_tx)
+                .bind(id)
+                .execute(&state.pool)
+                .await?;
+        }
+
+        tracing::info!(
+            contract_id = %contract_id,
+            count = count,
+            client_ip = client_ip,
+            timestamp = %chrono::Utc::now(),
+            "Events anonymized for contract (GDPR)"
+        );
+
+        crate::metrics::record_events_deleted(count);
+
+        Ok(Json(json!({
+            "contract_id": contract_id,
+            "action": "anonymized",
+            "count": count,
+        })))
+    } else {
+        // Hard delete
+        let result = sqlx::query("DELETE FROM events WHERE contract_id = $1")
+            .bind(&contract_id)
+            .execute(&state.pool)
+            .await?;
+
+        let count = result.rows_affected();
+
+        tracing::info!(
+            contract_id = %contract_id,
+            count = count,
+            client_ip = client_ip,
+            timestamp = %chrono::Utc::now(),
+            "Events deleted for contract (GDPR right-to-erasure)"
+        );
+
+        crate::metrics::record_events_deleted(count);
+
+        Ok(Json(json!({
+            "contract_id": contract_id,
+            "action": "deleted",
+            "count": count,
+        })))
+    }
 }
 
 /// Pause the indexer loop without stopping the HTTP server.
@@ -6159,6 +6476,227 @@ mod tests {
             .unwrap();
         // Should be rejected (400 validation error since no api_keys means guard fires)
         assert!(response.status().is_client_error());
+    }
+
+    // ── CSV escaping unit tests ──────────────────────────────────────────────
+
+    #[test]
+    fn csv_escape_plain_field_is_unchanged() {
+        assert_eq!(csv_escape_field("hello"), "hello");
+        assert_eq!(csv_escape_field("contract"), "contract");
+        assert_eq!(csv_escape_field(""), "");
+    }
+
+    #[test]
+    fn csv_escape_field_with_comma_is_quoted() {
+        assert_eq!(csv_escape_field("a,b"), "\"a,b\"");
+    }
+
+    #[test]
+    fn csv_escape_field_with_double_quote_doubles_it() {
+        assert_eq!(csv_escape_field(r#"say "hi""#), r#""say ""hi""""#);
+    }
+
+    #[test]
+    fn csv_escape_field_with_newline_is_quoted() {
+        assert_eq!(csv_escape_field("line1\nline2"), "\"line1\nline2\"");
+    }
+
+    #[test]
+    fn csv_escape_field_with_carriage_return_is_quoted() {
+        assert_eq!(csv_escape_field("line1\rline2"), "\"line1\rline2\"");
+    }
+
+    #[test]
+    fn csv_escape_field_with_comma_and_quote() {
+        // A field like: He said, "hello"
+        // Should become: "He said, ""hello"""
+        assert_eq!(
+            csv_escape_field(r#"He said, "hello""#),
+            r#""He said, ""hello""""#
+        );
+    }
+
+    #[test]
+    fn csv_escape_json_event_data() {
+        // Typical JSON event_data contains commas and double-quotes
+        let json = r#"{"key":"value","amount":100}"#;
+        let escaped = csv_escape_field(json);
+        // Must be wrapped in quotes and internal quotes doubled
+        assert!(escaped.starts_with('"'));
+        assert!(escaped.ends_with('"'));
+        assert!(escaped.contains("\"\"key\"\""));
+    }
+
+    // ── CSV format=csv explicit query param ──────────────────────────────────
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn export_events_format_csv_explicit_returns_csv(pool: PgPool) {
+        sqlx::query(
+            "INSERT INTO events (contract_id, event_type, tx_hash, ledger, timestamp, event_data)
+             VALUES ($1, $2, $3, $4, $5, $6)",
+        )
+        .bind("C1234567890123456789012345678901234567890123456789012345")
+        .bind("contract")
+        .bind("c".repeat(64))
+        .bind(5_i64)
+        .bind(Utc::now())
+        .bind(json!({"key": "value", "amount": 42}))
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let app = create_export_router(pool);
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/v1/events/export?format=csv")
+                    .header("Authorization", "Bearer test-key")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(response.headers().get("content-type").unwrap(), "text/csv");
+        assert!(response
+            .headers()
+            .get("content-disposition")
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .contains("events.csv"));
+
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let csv = String::from_utf8(body.to_vec()).unwrap();
+        let mut lines = csv.lines();
+        assert_eq!(
+            lines.next().unwrap(),
+            "id,contract_id,event_type,tx_hash,ledger,timestamp,event_data,created_at"
+        );
+        assert!(lines.next().is_some(), "expected at least one data row");
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn export_events_csv_escapes_special_characters(pool: PgPool) {
+        // Insert an event whose event_data contains commas and quotes (normal JSON)
+        sqlx::query(
+            "INSERT INTO events (contract_id, event_type, tx_hash, ledger, timestamp, event_data)
+             VALUES ($1, $2, $3, $4, $5, $6)",
+        )
+        .bind("C1234567890123456789012345678901234567890123456789012345")
+        .bind("contract")
+        .bind("d".repeat(64))
+        .bind(10_i64)
+        .bind(Utc::now())
+        // JSON with commas and quotes — both must be properly escaped in CSV
+        .bind(json!({"msg": "hello, world", "note": "say \"hi\""}))
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let app = create_export_router(pool);
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/v1/events/export?format=csv")
+                    .header("Authorization", "Bearer test-key")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let csv = String::from_utf8(body.to_vec()).unwrap();
+
+        // The data row must exist
+        let mut lines = csv.lines();
+        lines.next(); // skip header
+        let data_row = lines.next().expect("expected a data row");
+
+        // The event_data field must be quoted (contains commas and quotes)
+        assert!(
+            data_row.contains('"'),
+            "event_data with commas/quotes must be quoted in CSV: {data_row}"
+        );
+        // The row must not split on the comma inside the JSON value
+        // (i.e., the CSV parser should see exactly 8 fields)
+        let field_count = count_csv_fields(data_row);
+        assert_eq!(field_count, 8, "expected 8 CSV fields, got {field_count}: {data_row}");
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn export_events_csv_empty_db_returns_header_only(pool: PgPool) {
+        let app = create_export_router(pool);
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/v1/events/export?format=csv")
+                    .header("Authorization", "Bearer test-key")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(response.headers().get("content-type").unwrap(), "text/csv");
+
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let csv = String::from_utf8(body.to_vec()).unwrap();
+        let mut lines = csv.lines();
+        assert_eq!(
+            lines.next().unwrap(),
+            "id,contract_id,event_type,tx_hash,ledger,timestamp,event_data,created_at"
+        );
+        assert!(lines.next().is_none(), "empty DB should produce header row only");
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn export_events_unknown_format_returns_400(pool: PgPool) {
+        let app = create_export_router(pool);
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/v1/events/export?format=xlsx")
+                    .header("Authorization", "Bearer test-key")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    }
+
+    /// Minimal RFC 4180 field counter: counts top-level comma-separated fields,
+    /// respecting double-quoted fields (commas inside quotes don't count).
+    fn count_csv_fields(line: &str) -> usize {
+        let mut count = 1usize;
+        let mut in_quotes = false;
+        let mut chars = line.chars().peekable();
+        while let Some(ch) = chars.next() {
+            match ch {
+                '"' => {
+                    if in_quotes {
+                        // Peek: if next char is also '"', it's an escaped quote — skip it.
+                        if chars.peek() == Some(&'"') {
+                            chars.next();
+                        } else {
+                            in_quotes = false;
+                        }
+                    } else {
+                        in_quotes = true;
+                    }
+                }
+                ',' if !in_quotes => count += 1,
+                _ => {}
+            }
+        }
+        count
     }
 
     // ── Parquet export tests ─────────────────────────────────────────────────

@@ -196,6 +196,11 @@ pub fn increment_events_pruned(count: u64) {
     m::counter!("soroban_pulse_events_pruned_total").increment(count);
 }
 
+/// Record events deleted (GDPR right-to-erasure)
+pub fn record_events_deleted(count: u64) {
+    m::counter!("soroban_pulse_events_deleted_total").increment(count);
+}
+
 /// Record HTTP request duration
 pub fn record_http_request_duration(
     duration: std::time::Duration,
