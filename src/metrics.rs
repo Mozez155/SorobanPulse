@@ -182,6 +182,23 @@ pub fn record_email_failure() {
     m::counter!("soroban_pulse_email_failures_total").increment(1);
 }
 
+/// Record a full-text search query duration
+pub fn record_search_query_duration(duration: std::time::Duration) {
+    m::histogram!("soroban_pulse_search_query_duration_seconds").record(duration.as_secs_f64());
+}
+
+/// Increment the contract count cache invalidation counter
+pub fn record_contract_count_cache_invalidation() {
+    m::counter!("soroban_pulse_contract_count_cache_invalidations_total").increment(1);
+}
+
+/// Update the contract count cache hit ratio gauge (hits / (hits + misses))
+pub fn update_contract_count_cache_hit_ratio(hits: u64, misses: u64) {
+    let total = hits + misses;
+    let ratio = if total == 0 { 0.0 } else { hits as f64 / total as f64 };
+    m::gauge!("soroban_pulse_contract_count_cache_hit_ratio").set(ratio);
+}
+
 /// Record a Lua script timeout
 pub fn record_lua_timeout() {
     m::counter!("soroban_pulse_lua_timeout_total").increment(1);
@@ -191,9 +208,24 @@ pub fn record_replay_job() {
     m::counter!("soroban_pulse_replay_jobs_total").increment(1);
 }
 
+/// Record the number of database migrations applied during a run (issue #411)
+pub fn record_migrations_applied(count: u64) {
+    m::counter!("soroban_pulse_migrations_applied_total").increment(count);
+}
+
+/// Set the gauge tracking the highest applied migration version (issue #411)
+pub fn set_last_migration_version(version: i64) {
+    m::gauge!("soroban_pulse_last_migration_version").set(version as f64);
+}
+
 /// Record events pruned
 pub fn increment_events_pruned(count: u64) {
     m::counter!("soroban_pulse_events_pruned_total").increment(count);
+}
+
+/// Record events deleted (GDPR right-to-erasure)
+pub fn record_events_deleted(count: u64) {
+    m::counter!("soroban_pulse_events_deleted_total").increment(count);
 }
 
 /// Record HTTP request duration
@@ -215,6 +247,17 @@ pub fn record_http_request_duration(
 /// Update the active SSE connections count
 pub fn update_sse_connections(count: usize) {
     m::gauge!("soroban_pulse_sse_active_connections").set(count as f64);
+}
+
+/// Update the active WebSocket connections count
+pub fn update_ws_connections(count: usize) {
+    m::gauge!("soroban_pulse_ws_active_connections").set(count as f64);
+}
+
+/// Record timeseries query duration
+pub fn record_timeseries_query_duration(duration: std::time::Duration) {
+    m::histogram!("soroban_pulse_timeseries_query_duration_seconds")
+        .record(duration.as_secs_f64());
 }
 
 /// Record SSE multi-stream contract IDs per connection (histogram)
