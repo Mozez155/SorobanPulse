@@ -265,6 +265,21 @@ pub fn record_sse_multi_contract_ids(count: u64) {
     m::histogram!("soroban_pulse_sse_multi_contract_ids").record(count as f64);
 }
 
+/// Record a slow query (issue #421).
+pub fn record_slow_query(query_type: &str) {
+    m::counter!("soroban_pulse_slow_queries_total", "query_type" => query_type.to_string())
+        .increment(1);
+}
+
+/// Record query duration per query type (issue #421).
+pub fn record_query_duration(query_type: &str, duration: std::time::Duration) {
+    m::histogram!(
+        "soroban_pulse_query_duration_seconds",
+        "query_type" => query_type.to_string()
+    )
+    .record(duration.as_secs_f64());
+}
+
 /// Update DB connection pool metrics
 pub fn update_db_pool_metrics(pool: &PgPool) {
     m::gauge!("soroban_pulse_db_pool_size").set(pool.size() as f64);

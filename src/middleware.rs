@@ -196,6 +196,33 @@ pub async fn security_headers_middleware(req: Request, next: Next) -> Response {
     response
 }
 
+/// Middleware that handles HTTP HEAD requests (issue #422).
+/// Converts HEAD to GET, runs the handler, then strips the body while
+/// preserving all headers (including Content-Length and ETag).
+pub async fn head_middleware(req: Request, next: Next) -> Response {
+    use axum::http::Method;
+    let is_head = req.method() == Method::HEAD;
+    if !is_head {
+        return next.run(req).await;
+    }
+    // Re-run as GET so the handler produces headers normally.
+    let (mut parts, body) = req.into_parts();
+    parts.method = Method::GET;
+    let get_req = Request::from_parts(parts, body);
+    let response = next.run(get_req).await;
+
+    // Collect body to compute Content-Length, then discard it.
+    let (mut resp_parts, resp_body) = response.into_parts();
+    let body_bytes = axum::body::to_bytes(resp_body, usize::MAX)
+        .await
+        .unwrap_or_default();
+    resp_parts.headers.insert(
+        axum::http::header::CONTENT_LENGTH,
+        body_bytes.len().to_string().parse().unwrap(),
+    );
+    Response::from_parts(resp_parts, axum::body::Body::empty())
+}
+
 pub async fn cache_middleware(req: Request, next: Next) -> Response {
     let path = req.uri().path().to_owned();
     let query = req.uri().query().unwrap_or("").to_owned();

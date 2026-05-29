@@ -451,6 +451,7 @@ pub fn create_router_with_tx_and_tenant_map(
                     let resp = next.run(req).await;
                     if resp.status() == axum::http::StatusCode::TOO_MANY_REQUESTS {
                         metrics::record_rate_limit_rejected();
+                        return rate_limit_json_response(resp);
                     }
                     resp
                 },
@@ -477,6 +478,7 @@ pub fn create_router_with_tx_and_tenant_map(
                     let resp = next.run(req).await;
                     if resp.status() == axum::http::StatusCode::TOO_MANY_REQUESTS {
                         metrics::record_rate_limit_rejected();
+                        return rate_limit_json_response(resp);
                     }
                     resp
                 },
@@ -490,6 +492,7 @@ pub fn create_router_with_tx_and_tenant_map(
         .layer(axum::middleware::from_fn(
             middleware::security_headers_middleware,
         ))
+        .layer(axum::middleware::from_fn(middleware::head_middleware))
         .layer(axum::middleware::from_fn(middleware::request_id_middleware))
         .layer(axum::middleware::from_fn_with_state(
             auth_state,
@@ -550,6 +553,29 @@ pub fn create_router_with_tx_and_tenant_map(
         .layer(SetRequestIdLayer::x_request_id(UuidMakeRequestId))
         .layer(RequestBodyLimitLayer::new(1024 * 1024)) // 1 MB default
         .with_state(app_state)
+}
+
+/// Rewrite a 429 Too Many Requests response to the standard JSON ErrorResponse
+/// format (issue #424). Preserves all rate-limit headers from the original.
+fn rate_limit_json_response(original: axum::response::Response<Body>) -> axum::response::Response<Body> {
+    use axum::http::header;
+    let correlation_id = crate::error::get_request_id();
+    let body = serde_json::json!({
+        "error": "rate limit exceeded",
+        "code": "RATE_LIMIT_EXCEEDED",
+        "correlation_id": correlation_id,
+    });
+    let json_bytes = body.to_string();
+    let mut builder = axum::response::Response::builder()
+        .status(axum::http::StatusCode::TOO_MANY_REQUESTS)
+        .header(header::CONTENT_TYPE, "application/json");
+    // Forward rate-limit headers from the original response.
+    for (name, value) in original.headers() {
+        if name != header::CONTENT_TYPE {
+            builder = builder.header(name, value);
+        }
+    }
+    builder.body(Body::from(json_bytes)).unwrap()
 }
 
 fn build_cors(allowed_origins: &[String]) -> CorsLayer {
@@ -884,5 +910,145 @@ mod tests {
             expose.to_lowercase().contains("x-request-id"),
             "expose headers: {expose}"
         );
+    }
+
+    // ── Issue #422: HEAD request support ─────────────────────────────────────
+
+    #[tokio::test]
+    async fn head_request_returns_200_no_body() {
+        use crate::middleware::head_middleware;
+        let app = Router::new()
+            .route("/v1/events", get(|| async { "hello world" }))
+            .layer(axum::middleware::from_fn(head_middleware));
+
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method("HEAD")
+                    .uri("/v1/events")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body_bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert!(body_bytes.is_empty(), "HEAD response body must be empty");
+    }
+
+    #[tokio::test]
+    async fn head_request_content_length_matches_get() {
+        use crate::middleware::head_middleware;
+        let app = Router::new()
+            .route("/v1/events", get(|| async { "hello world" }))
+            .layer(axum::middleware::from_fn(head_middleware));
+
+        let head_resp = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("HEAD")
+                    .uri("/v1/events")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        let get_resp = app
+            .oneshot(
+                Request::builder()
+                    .uri("/v1/events")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        let get_body = axum::body::to_bytes(get_resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let expected_len = get_body.len().to_string();
+
+        let content_length = head_resp
+            .headers()
+            .get(header::CONTENT_LENGTH)
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("");
+        assert_eq!(content_length, expected_len);
+    }
+
+    // ── Issue #424: machine-readable 429 JSON response ────────────────────────
+
+    fn rate_limited_json_test_app(burst: u32) -> Router {
+        let governor_conf = Arc::new(
+            GovernorConfigBuilder::default()
+                .per_millisecond(60_000u64 / u64::from(burst.max(1)))
+                .burst_size(burst)
+                .key_extractor(SmartIpKeyExtractor)
+                .use_headers()
+                .finish()
+                .expect("invalid governor config"),
+        );
+        Router::new()
+            .route("/test", get(|| async { "ok" }))
+            .layer(axum::middleware::from_fn(
+                |req: Request<Body>, next: axum::middleware::Next| async move {
+                    let resp = next.run(req).await;
+                    if resp.status() == axum::http::StatusCode::TOO_MANY_REQUESTS {
+                        return rate_limit_json_response(resp);
+                    }
+                    resp
+                },
+            ))
+            .layer(GovernorLayer::new(governor_conf))
+    }
+
+    #[tokio::test]
+    async fn rate_limit_429_returns_json_error_response() {
+        let app = rate_limited_json_test_app(1);
+
+        // Exhaust burst.
+        let _ = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/test")
+                    .header("X-Forwarded-For", "5.6.7.8")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        // This request should be rate-limited.
+        let resp = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/test")
+                    .header("X-Forwarded-For", "5.6.7.8")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(resp.status(), StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(
+            resp.headers().get(header::CONTENT_TYPE).and_then(|v| v.to_str().ok()),
+            Some("application/json")
+        );
+
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&body).expect("body must be valid JSON");
+        assert_eq!(v["code"], "RATE_LIMIT_EXCEEDED");
+        assert!(v["error"].as_str().is_some());
+        assert!(v["correlation_id"].as_str().is_some());
     }
 }

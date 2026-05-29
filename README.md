@@ -63,6 +63,7 @@ Open the newly created `.env` file in your editor and fill in your own real valu
 | `RATE_LIMIT_PER_MINUTE` | Maximum requests per IP per minute (0 = unlimited) | `60`                         |
 | `SSE_KEEPALIVE_SECS` | SSE keep-alive ping interval in seconds (1–60) | `15`                              |
 | `INDEXER_LOCK_RETRY_SECS` | How often standby replicas retry the advisory lock | `30`                    |
+| `SLOW_QUERY_THRESHOLD_MS` | Queries exceeding this duration are logged at WARN and counted in metrics | `1000` |
 | `OTEL_EXPORTER_OTLP_ENDPOINT` | OpenTelemetry OTLP collector endpoint (when built with `otel` feature) | `http://localhost:4317` |
 
 > **Note on Authentication:** You can enable optional API key authentication by setting the `API_KEY` environment variable. When set, all requests (except `/health` and `/healthz/*` endpoints) will require either an `Authorization: Bearer <API_KEY>` or an `X-Api-Key: <API_KEY>` header. If `API_KEY` is unset or omitted from your configuration, authentication is bypassed and all requests pass through.

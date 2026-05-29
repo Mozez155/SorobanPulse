@@ -32,6 +32,34 @@ use crate::{
 };
 use std::sync::atomic::Ordering;
 
+/// Execute a future (typically a DB query), record its duration, and warn if it
+/// exceeds `threshold_ms`. Returns the future's output unchanged.
+async fn timed_query<F, T>(
+    fut: F,
+    query_type: &str,
+    threshold_ms: u64,
+    context: Option<&str>,
+) -> T
+where
+    F: std::future::Future<Output = T>,
+{
+    let start = std::time::Instant::now();
+    let result = fut.await;
+    let elapsed = start.elapsed();
+    crate::metrics::record_query_duration(query_type, elapsed);
+    if elapsed.as_millis() as u64 > threshold_ms {
+        crate::metrics::record_slow_query(query_type);
+        tracing::warn!(
+            query_type = %query_type,
+            duration_ms = elapsed.as_millis(),
+            threshold_ms = threshold_ms,
+            context = context.unwrap_or("-"),
+            "slow query detected"
+        );
+    }
+    result
+}
+
 /// Compute a lightweight ETag from the last event id, created_at, and total count.
 /// Uses SHA-256 truncated to 8 bytes, base64-encoded — no double-serialization needed.
 fn compute_etag(last_id: &Uuid, last_created_at: &DateTime<Utc>, total: Option<i64>) -> String {
@@ -229,6 +257,18 @@ fn resolve_columns<'a>(params: &'a PaginationParams) -> Result<Vec<&'a str>, App
             allowed.join(", ")
         ))
     })
+}
+
+/// Stellar ledger sequences are 32-bit unsigned integers (max 2^32 - 1).
+/// Validate that a ledger parameter is within [0, 2^32 - 1] (issue #423).
+pub(crate) fn validate_ledger_param(name: &str, value: i64) -> Result<(), AppError> {
+    const MAX_LEDGER: i64 = u32::MAX as i64; // 4_294_967_295
+    if value < 0 || value > MAX_LEDGER {
+        return Err(AppError::Validation(format!(
+            "{name} must be in range [0, {MAX_LEDGER}]"
+        )));
+    }
+    Ok(())
 }
 
 pub(crate) fn validate_contract_id(contract_id: &str) -> Result<(), AppError> {
@@ -1283,6 +1323,12 @@ pub async fn get_events(
     let tenant_id = extract_tenant_id(&extensions).map(|s| s.to_owned());
     let tenant_id = tenant_id.as_deref();
     // Validate ledger range
+    if let Some(from) = params.from_ledger {
+        validate_ledger_param("from_ledger", from)?;
+    }
+    if let Some(to) = params.to_ledger {
+        validate_ledger_param("to_ledger", to)?;
+    }
     if let (Some(from), Some(to)) = (params.from_ledger, params.to_ledger) {
         if from > to {
             return Err(AppError::Validation(
@@ -1517,7 +1563,13 @@ pub async fn get_events(
         q = q.bind(limit);
 
         let _db_span = info_span!("db_query", query_type = "get_events_cursor").entered();
-        let rows = q.fetch_all(&state.read_pool).await?;
+        let rows = timed_query(
+            q.fetch_all(&state.read_pool),
+            "get_events_cursor",
+            state.config.slow_query_threshold_ms,
+            None,
+        )
+        .await?;
         drop(_db_span);
 
         let has_more = rows.len() as i64 == limit;
@@ -1749,7 +1801,13 @@ pub async fn get_events(
     q = q.bind(limit).bind(offset);
 
     let _db_span = info_span!("db_query", query_type = "get_events_offset").entered();
-    let rows = q.fetch_all(&state.read_pool).await?;
+    let rows = timed_query(
+        q.fetch_all(&state.read_pool),
+        "get_events_offset",
+        state.config.slow_query_threshold_ms,
+        None,
+    )
+    .await?;
     drop(_db_span);
 
     let has_more = rows.len() as i64 == limit;
@@ -1983,26 +2041,25 @@ pub async fn export_events(
             ));
         }
     }
+    if let Some(from) = params.from_ledger {
+        validate_ledger_param("from_ledger", from)?;
+    }
+    if let Some(to) = params.to_ledger {
+        validate_ledger_param("to_ledger", to)?;
+    }
 
     let fmt = params.format.as_deref().unwrap_or("csv");
-    let want_parquet = fmt == "parquet";
     let want_csv = fmt == "csv" || fmt.is_empty();
+    let want_parquet = fmt == "parquet";
+    let want_jsonl = fmt == "jsonl" || fmt == "ndjson";
 
-    if !want_parquet && !want_csv {
+    if !want_csv && !want_parquet && !want_jsonl {
         return Err(AppError::Validation(format!(
-            "unsupported format '{fmt}': use 'csv' or 'parquet'"
+            "unsupported format '{fmt}': use 'csv', 'parquet', or 'jsonl'"
         )));
     }
 
-    #[cfg(not(feature = "parquet"))]
-    if want_parquet {
-        return Err(AppError::Validation(
-            "parquet export requires the 'parquet' feature flag".to_string(),
-        ));
-    }
-
     let max_rows = state.config.export_max_rows as i64;
-
     let mut conditions: Vec<String> = Vec::new();
     let mut bind_idx: i32 = 1;
 
@@ -2357,6 +2414,12 @@ pub async fn get_events_by_contract(
 ) -> Result<Json<Value>, AppError> {
     validate_contract_id(&contract_id)?;
 
+    if let Some(from) = params.from_ledger {
+        validate_ledger_param("from_ledger", from)?;
+    }
+    if let Some(to) = params.to_ledger {
+        validate_ledger_param("to_ledger", to)?;
+    }
     if let (Some(from), Some(to)) = (params.from_ledger, params.to_ledger) {
         if from > to {
             return Err(AppError::Validation(
@@ -2409,7 +2472,13 @@ pub async fn get_events_by_contract(
     }
     q = q.bind(limit).bind(offset);
 
-    let rows = q.fetch_all(&state.read_pool).await?;
+    let rows = timed_query(
+        q.fetch_all(&state.read_pool),
+        "get_events_by_contract",
+        state.config.slow_query_threshold_ms,
+        Some(&contract_id),
+    )
+    .await?;
 
     if rows.is_empty() {
         return Err(AppError::NotFound);
@@ -2545,7 +2614,13 @@ pub async fn get_events_by_tx(
     if let Some(tid) = tenant_id {
         q = q.bind(tid);
     }
-    let rows = q.fetch_all(&state.read_pool).await?;
+    let rows = timed_query(
+        q.fetch_all(&state.read_pool),
+        "get_events_by_tx",
+        state.config.slow_query_threshold_ms,
+        Some(&tx_hash),
+    )
+    .await?;
 
     let total = rows.len() as i64;
     let events = rows_to_json(
@@ -7793,6 +7868,136 @@ mod tests {
         let body = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
         let v: Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(v["total"], json!(2));
+    }
+
+    // ── Issue #421: slow query detection ─────────────────────────────────────
+
+    #[tokio::test]
+    async fn slow_query_warn_is_emitted_when_threshold_exceeded() {
+        use tracing_subscriber::layer::SubscriberExt;
+        let (writer, output) = tracing_subscriber::fmt::TestWriter::new();
+        let subscriber = tracing_subscriber::fmt()
+            .with_max_level(tracing::Level::WARN)
+            .with_writer(writer)
+            .finish();
+        let _guard = tracing::subscriber::set_default(subscriber);
+
+        // threshold=0 → any query duration triggers the warning
+        timed_query(
+            async { 42u32 },
+            "test_query",
+            0,
+            Some("ctx"),
+        )
+        .await;
+
+        let logs = output.into_string();
+        assert!(
+            logs.contains("slow query detected"),
+            "expected 'slow query detected' warn, got: {logs}"
+        );
+    }
+
+    #[tokio::test]
+    async fn slow_query_no_warn_when_under_threshold() {
+        use tracing_subscriber::layer::SubscriberExt;
+        let (writer, output) = tracing_subscriber::fmt::TestWriter::new();
+        let subscriber = tracing_subscriber::fmt()
+            .with_max_level(tracing::Level::WARN)
+            .with_writer(writer)
+            .finish();
+        let _guard = tracing::subscriber::set_default(subscriber);
+
+        // threshold=60_000ms → instant future never triggers warning
+        timed_query(
+            async { 42u32 },
+            "test_query",
+            60_000,
+            None,
+        )
+        .await;
+
+        let logs = output.into_string();
+        assert!(
+            !logs.contains("slow query detected"),
+            "unexpected 'slow query detected' warn: {logs}"
+        );
+    }
+
+    // ── Issue #423: ledger range bounds validation ────────────────────────────
+
+    #[test]
+    fn validate_ledger_param_accepts_zero() {
+        assert!(validate_ledger_param("from_ledger", 0).is_ok());
+    }
+
+    #[test]
+    fn validate_ledger_param_accepts_max_u32() {
+        assert!(validate_ledger_param("from_ledger", u32::MAX as i64).is_ok());
+    }
+
+    #[test]
+    fn validate_ledger_param_rejects_negative() {
+        let err = validate_ledger_param("from_ledger", -1).unwrap_err();
+        match err {
+            AppError::Validation(msg) => assert!(msg.contains("from_ledger")),
+            _ => panic!("expected Validation error"),
+        }
+    }
+
+    #[test]
+    fn validate_ledger_param_rejects_above_u32_max() {
+        let err = validate_ledger_param("to_ledger", u32::MAX as i64 + 1).unwrap_err();
+        match err {
+            AppError::Validation(msg) => assert!(msg.contains("to_ledger")),
+            _ => panic!("expected Validation error"),
+        }
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn get_events_rejects_negative_from_ledger(pool: PgPool) {
+        let app = create_test_router(pool);
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .uri("/v1/events?from_ledger=-1")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn get_events_rejects_out_of_range_to_ledger(pool: PgPool) {
+        let app = create_test_router(pool);
+        // 2^32 = 4_294_967_296 — one above u32::MAX
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .uri("/v1/events?to_ledger=4294967296")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn get_events_by_contract_rejects_negative_from_ledger(pool: PgPool) {
+        let app = create_test_router(pool);
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .uri("/v1/events/contract/CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA?from_ledger=-5")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
     }
 }
 

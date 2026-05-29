@@ -266,6 +266,10 @@ pub struct Config {
     pub indexer_ignore_checkpoint: bool,
     // Issue #426: Maximum events per RPC page
     pub rpc_max_events_per_page: usize,
+    /// Maximum ledger range for diff/range queries.
+    pub max_ledger_range: u64,
+    /// Queries exceeding this duration (ms) are logged at WARN level (issue #421).
+    pub slow_query_threshold_ms: u64,
 }
 
 impl Default for Config {
@@ -343,6 +347,9 @@ impl Default for Config {
             sse_replay_limit: 500,
             indexer_ignore_checkpoint: false,
             webhook_require_https: false,
+            rpc_max_events_per_page: 200,
+            max_ledger_range: 100_000,
+            slow_query_threshold_ms: 1000,
         }
     }
 }
@@ -1129,6 +1136,13 @@ impl Config {
                 &mut errors,
             )
             .unwrap_or(200),
+            slow_query_threshold_ms: parse_int::<u64>(
+                "SLOW_QUERY_THRESHOLD_MS",
+                &env_or_file_or("SLOW_QUERY_THRESHOLD_MS", &file, "1000"),
+                "1000",
+                &mut errors,
+            )
+            .unwrap_or(1000),
         }
     }
 }
