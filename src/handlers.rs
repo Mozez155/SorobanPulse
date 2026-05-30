@@ -1,3 +1,58 @@
+// --- Async Export Job and Import Endpoint Stubs ---
+use std::collections::HashMap;
+use std::sync::Arc;
+use tokio::sync::RwLock;
+
+// Dummy job store for demonstration
+type JobId = String;
+type JobStatus = String;
+static EXPORT_JOBS: OnceLock<Arc<RwLock<HashMap<JobId, JobStatus>>>> = OnceLock::new();
+static IMPORT_JOBS: OnceLock<Arc<RwLock<HashMap<JobId, JobStatus>>>> = OnceLock::new();
+
+fn export_jobs() -> Arc<RwLock<HashMap<JobId, JobStatus>>> {
+    EXPORT_JOBS.get_or_init(|| Arc::new(RwLock::new(HashMap::new()))).clone()
+}
+fn import_jobs() -> Arc<RwLock<HashMap<JobId, JobStatus>>> {
+    IMPORT_JOBS.get_or_init(|| Arc::new(RwLock::new(HashMap::new()))).clone()
+}
+
+/// Start an async export job (stub)
+pub async fn start_export_job(State(_state): State<AppState>) -> impl IntoResponse {
+    let job_id = Uuid::new_v4().to_string();
+    export_jobs().write().await.insert(job_id.clone(), "pending".to_string());
+    Json(json!({"job_id": job_id}))
+}
+
+/// Get export job status (stub)
+pub async fn get_export_job_status(Path(job_id): Path<String>) -> impl IntoResponse {
+    let status = export_jobs().read().await.get(&job_id).cloned().unwrap_or("not_found".to_string());
+    Json(json!({"job_id": job_id, "status": status, "progress": 42}))
+}
+
+/// Download completed export (stub)
+pub async fn download_export_job(Path(job_id): Path<String>) -> impl IntoResponse {
+    // Just return a dummy file
+    let data = b"exported data";
+    Response::builder()
+        .status(StatusCode::OK)
+        .header(header::CONTENT_TYPE, "application/octet-stream")
+        .header(header::CONTENT_DISPOSITION, format!("attachment; filename=\"export_{job_id}.bin\""))
+        .body(Body::from(data.as_slice()))
+        .unwrap()
+}
+
+/// Start an import job (stub)
+pub async fn start_import_job(State(_state): State<AppState>) -> impl IntoResponse {
+    let job_id = Uuid::new_v4().to_string();
+    import_jobs().write().await.insert(job_id.clone(), "pending".to_string());
+    Json(json!({"job_id": job_id}))
+}
+
+/// Get import job status (stub)
+pub async fn get_import_job_status(Path(job_id): Path<String>) -> impl IntoResponse {
+    let status = import_jobs().read().await.get(&job_id).cloned().unwrap_or("not_found".to_string());
+    Json(json!({"job_id": job_id, "status": status, "progress": 42}))
+}
 use axum::body::Body;
 use axum::http::{header, HeaderMap};
 use axum::response::sse::{Event, Sse};
@@ -2227,6 +2282,14 @@ pub async fn export_events(
     if let Some(to) = params.to_ledger {
         validate_ledger_param("to_ledger", to)?;
     }
+    // Validate timestamp range
+    if let (Some(from_ts), Some(to_ts)) = (params.from_timestamp, params.to_timestamp) {
+        if from_ts >= to_ts {
+            return Err(AppError::Validation(
+                "from_timestamp must be < to_timestamp".to_string(),
+            ));
+        }
+    }
 
     let fmt = params.format.as_deref().unwrap_or("csv");
     let want_csv = fmt == "csv" || fmt.is_empty();
@@ -2238,6 +2301,12 @@ pub async fn export_events(
             "unsupported format '{fmt}': use 'csv', 'parquet', or 'jsonl'"
         )));
     }
+
+    // Compression support
+    let accept_encoding = headers.get(axum::http::header::ACCEPT_ENCODING)
+        .and_then(|v| v.to_str().ok()).unwrap_or("");
+    let use_gzip = accept_encoding.contains("gzip");
+    let use_br = accept_encoding.contains("br");
 
     let max_rows = state.config.export_max_rows as i64;
     let mut conditions: Vec<String> = Vec::new();
@@ -2257,6 +2326,14 @@ pub async fn export_events(
     }
     if params.to_ledger.is_some() {
         conditions.push(format!("ledger <= ${bind_idx}"));
+        bind_idx += 1;
+    }
+    if params.from_timestamp.is_some() {
+        conditions.push(format!("timestamp >= ${bind_idx}"));
+        bind_idx += 1;
+    }
+    if params.to_timestamp.is_some() {
+        conditions.push(format!("timestamp <= ${bind_idx}"));
         bind_idx += 1;
     }
 
@@ -2283,6 +2360,12 @@ pub async fn export_events(
     }
     if let Some(tl) = params.to_ledger {
         q = q.bind(tl);
+    }
+    if let Some(from_ts) = params.from_timestamp {
+        q = q.bind(from_ts);
+    }
+    if let Some(to_ts) = params.to_timestamp {
+        q = q.bind(to_ts);
     }
     q = q.bind(max_rows);
 
@@ -2335,58 +2418,40 @@ pub async fn export_events(
     // JSON Lines format
     if want_jsonl {
         let mut jsonl = String::new();
-        // Default ordering of columns in export
-        let default_cols = [
-            "id",
-            "contract_id",
-            "event_type",
-            "tx_hash",
-            "ledger",
-            "timestamp",
-            "event_data",
-            "created_at",
-        ];
+        // ...existing code...
         for row in &rows {
-            let id: uuid::Uuid = row.try_get("id")?;
-            let contract_id: String = row.try_get("contract_id")?;
-            let event_type: String = row.try_get("event_type")?;
-            let tx_hash: String = row.try_get("tx_hash")?;
-            let ledger: i64 = row.try_get("ledger")?;
-            let timestamp: chrono::DateTime<chrono::Utc> = row.try_get("timestamp")?;
-            let event_data: serde_json::Value = row.try_get("event_data")?;
-            let created_at: chrono::DateTime<chrono::Utc> = row.try_get("created_at")?;
-            
-            let mut map = serde_json::Map::new();
-            for col in &default_cols {
-                let key = field_map.as_ref().and_then(|m| m.get(*col)).map(|s| s.as_str()).unwrap_or(*col);
-                match *col {
-                    "id" => { map.insert(key.to_string(), serde_json::json!(id)); }
-                    "contract_id" => { map.insert(key.to_string(), serde_json::json!(contract_id)); }
-                    "event_type" => { map.insert(key.to_string(), serde_json::json!(event_type)); }
-                    "tx_hash" => { map.insert(key.to_string(), serde_json::json!(tx_hash)); }
-                    "ledger" => { map.insert(key.to_string(), serde_json::json!(ledger)); }
-                    "timestamp" => { map.insert(key.to_string(), serde_json::json!(timestamp)); }
-                    "event_data" => { map.insert(key.to_string(), event_data.clone()); }
-                    "created_at" => { map.insert(key.to_string(), serde_json::json!(created_at)); }
-                    _ => {}
-                }
-            }
-            let obj = serde_json::Value::Object(map);
-            
-            jsonl.push_str(&obj.to_string());
-            jsonl.push('\n');
+            // ...existing code...
         }
-        
-        return Ok(Response::builder()
+        let mut body: Vec<u8> = jsonl.into_bytes();
+        let mut content_encoding = None;
+        if use_gzip {
+            let mut encoder = async_compression::tokio::bufread::GzipEncoder::new(body.as_slice());
+            body = tokio::runtime::Handle::current().block_on(async {
+                use tokio::io::AsyncReadExt;
+                let mut buf = Vec::new();
+                encoder.read_to_end(&mut buf).await.unwrap();
+                buf
+            });
+            content_encoding = Some("gzip");
+        } else if use_br {
+            let mut encoder = async_compression::tokio::bufread::BrotliEncoder::new(body.as_slice());
+            body = tokio::runtime::Handle::current().block_on(async {
+                use tokio::io::AsyncReadExt;
+                let mut buf = Vec::new();
+                encoder.read_to_end(&mut buf).await.unwrap();
+                buf
+            });
+            content_encoding = Some("br");
+        }
+        let mut builder = Response::builder()
             .status(StatusCode::OK)
             .header(header::CONTENT_TYPE, "application/x-ndjson")
-            .header(
-                header::CONTENT_DISPOSITION,
-                "attachment; filename=\"events.jsonl\"",
-            )
-            .header("Content-Range", content_range)
-            .body(Body::from(jsonl))
-            .unwrap());
+            .header(header::CONTENT_DISPOSITION, "attachment; filename=\"events.jsonl\"")
+            .header("Content-Range", content_range);
+        if let Some(enc) = content_encoding {
+            builder = builder.header(header::CONTENT_ENCODING, enc);
+        }
+        return Ok(builder.body(Body::from(body)).unwrap());
     }
 
     #[cfg(feature = "parquet")]
@@ -2408,20 +2473,40 @@ pub async fn export_events(
             })
             .collect::<Result<_, _>>()?;
 
-        let bytes =
-            write_events_parquet_with_field_map(&event_rows, field_map.as_ref())
+        let mut bytes = write_events_parquet_with_field_map(&event_rows, field_map.as_ref())
             .map_err(|e| AppError::Internal(e.to_string()))?;
-
-        return Ok(Response::builder()
+        let mut content_encoding = None;
+        let mut filename = "events.parquet";
+        if use_gzip {
+            let mut encoder = async_compression::tokio::bufread::GzipEncoder::new(bytes.as_slice());
+            bytes = tokio::runtime::Handle::current().block_on(async {
+                use tokio::io::AsyncReadExt;
+                let mut buf = Vec::new();
+                encoder.read_to_end(&mut buf).await.unwrap();
+                buf
+            });
+            content_encoding = Some("gzip");
+            filename = "events.parquet.gz";
+        } else if use_br {
+            let mut encoder = async_compression::tokio::bufread::BrotliEncoder::new(bytes.as_slice());
+            bytes = tokio::runtime::Handle::current().block_on(async {
+                use tokio::io::AsyncReadExt;
+                let mut buf = Vec::new();
+                encoder.read_to_end(&mut buf).await.unwrap();
+                buf
+            });
+            content_encoding = Some("br");
+            filename = "events.parquet.br";
+        }
+        let mut builder = Response::builder()
             .status(StatusCode::OK)
             .header(header::CONTENT_TYPE, "application/octet-stream")
-            .header(
-                header::CONTENT_DISPOSITION,
-                "attachment; filename=\"events.parquet\"",
-            )
-            .header("Content-Range", content_range)
-            .body(Body::from(bytes))
-            .unwrap());
+            .header(header::CONTENT_DISPOSITION, format!("attachment; filename=\"{}\"", filename))
+            .header("Content-Range", content_range);
+        if let Some(enc) = content_encoding {
+            builder = builder.header(header::CONTENT_ENCODING, enc);
+        }
+        return Ok(builder.body(Body::from(bytes)).unwrap());
     }
 
     // Default: CSV (RFC 4180)
@@ -2446,11 +2531,8 @@ pub async fn export_events(
         .map(|c| field_map.as_ref().and_then(|m| m.get(*c)).cloned().unwrap_or_else(|| (*c).to_string()))
         .collect();
     let csv_header = format!("{}\n", header_names.join(","));
-    // Collect row chunks; the header is the first chunk.
-    let mut chunks: Vec<Result<Bytes, std::convert::Infallible>> =
-        Vec::with_capacity(rows.len() + 1);
-    chunks.push(Ok(Bytes::from_static(CSV_HEADER.as_bytes())));
-
+    let mut csv_data = String::with_capacity(rows.len() * 128 + 128);
+    csv_data.push_str(&csv_header);
     for row in &rows {
         let id: uuid::Uuid = row.try_get("id")?;
         let contract_id: String = row.try_get("contract_id")?;
@@ -2460,11 +2542,7 @@ pub async fn export_events(
         let timestamp: chrono::DateTime<chrono::Utc> = row.try_get("timestamp")?;
         let event_data: serde_json::Value = row.try_get("event_data")?;
         let created_at: chrono::DateTime<chrono::Utc> = row.try_get("created_at")?;
-
-        // Serialize event_data to a JSON string, then escape it as a CSV field.
         let data_str = event_data.to_string();
-
-        // Build CSV line according to header order (mapped names don't affect values order)
         let mut values: Vec<String> = Vec::with_capacity(default_cols.len());
         for col in &default_cols {
             match *col {
@@ -2480,19 +2558,41 @@ pub async fn export_events(
             }
         }
         let line = format!("{}\n", values.join(","));
-        chunks.push(Ok(Bytes::from(line)));
+        csv_data.push_str(&line);
     }
-
-    Ok(Response::builder()
+    let mut body: Vec<u8> = csv_data.into_bytes();
+    let mut content_encoding = None;
+    let mut filename = "events.csv";
+    if use_gzip {
+        let mut encoder = async_compression::tokio::bufread::GzipEncoder::new(body.as_slice());
+        body = tokio::runtime::Handle::current().block_on(async {
+            use tokio::io::AsyncReadExt;
+            let mut buf = Vec::new();
+            encoder.read_to_end(&mut buf).await.unwrap();
+            buf
+        });
+        content_encoding = Some("gzip");
+        filename = "events.csv.gz";
+    } else if use_br {
+        let mut encoder = async_compression::tokio::bufread::BrotliEncoder::new(body.as_slice());
+        body = tokio::runtime::Handle::current().block_on(async {
+            use tokio::io::AsyncReadExt;
+            let mut buf = Vec::new();
+            encoder.read_to_end(&mut buf).await.unwrap();
+            buf
+        });
+        content_encoding = Some("br");
+        filename = "events.csv.br";
+    }
+    let mut builder = Response::builder()
         .status(StatusCode::OK)
         .header(header::CONTENT_TYPE, "text/csv")
-        .header(
-            header::CONTENT_DISPOSITION,
-            "attachment; filename=\"events.csv\"",
-        )
-        .header("Content-Range", content_range)
-        .body(Body::from_stream(stream::iter(chunks)))
-        .unwrap())
+        .header(header::CONTENT_DISPOSITION, format!("attachment; filename=\"{}\"", filename))
+        .header("Content-Range", content_range);
+    if let Some(enc) = content_encoding {
+        builder = builder.header(header::CONTENT_ENCODING, enc);
+    }
+    Ok(builder.body(Body::from(body)).unwrap())
 }
 
 /// Query parameters for the /v1/events/recent endpoint.

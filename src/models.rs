@@ -211,6 +211,10 @@ pub struct ExportParams {
     /// Optional JSON object mapping source field names to target field names.
     /// Example: `{"event_data":"raw_data","ledger":"ledger_seq"}`
     pub field_map: Option<String>,
+    /// Optional ISO 8601 timestamp filter (start)
+    pub from_timestamp: Option<chrono::DateTime<chrono::Utc>>,
+    /// Optional ISO 8601 timestamp filter (end)
+    pub to_timestamp: Option<chrono::DateTime<chrono::Utc>>,
 }
 
 /// Request body for POST /v1/admin/mask-events
