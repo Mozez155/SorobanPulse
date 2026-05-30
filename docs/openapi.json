@@ -151,6 +151,26 @@
             }
           },
           {
+            "name": "ledger_hash",
+            "in": "query",
+            "description": "Filter events by ledger hash",
+            "required": false,
+            "schema": {
+              "type": "string",
+              "nullable": true
+            }
+          },
+          {
+            "name": "anonymized",
+            "in": "query",
+            "description": "Filter events by anonymized status (admin only)",
+            "required": false,
+            "schema": {
+              "type": "boolean",
+              "nullable": true
+            }
+          },
+          {
             "name": "from_timestamp",
             "in": "query",
             "description": "Return events at or after this timestamp (ISO 8601 format, e.g., 2026-03-14T00:00:00Z)",
@@ -169,6 +189,25 @@
               "type": "string",
               "nullable": true
             }
+          "/v1/events/export": {
+            "get": {
+              "tags": ["events"],
+              "operationId": "export_events",
+              "parameters": [
+                { "name": "format", "in": "query", "description": "Output format: csv (default), parquet, or jsonl", "required": false, "schema": { "type": "string", "nullable": true } },
+                { "name": "event_type", "in": "query", "description": "Filter by event type", "required": false, "schema": { "type": "string", "nullable": true } },
+                { "name": "from_ledger", "in": "query", "description": "Return events at or after this ledger", "required": false, "schema": { "type": "integer", "format": "int64", "nullable": true } },
+                { "name": "to_ledger", "in": "query", "description": "Return events at or before this ledger", "required": false, "schema": { "type": "integer", "format": "int64", "nullable": true } },
+                { "name": "contract_id", "in": "query", "description": "Filter by contract ID", "required": false, "schema": { "type": "string", "nullable": true } },
+                { "name": "field_map", "in": "query", "description": "Optional JSON object mapping source field names to target output names", "required": false, "schema": { "type": "string", "nullable": true } }
+              ],
+              "responses": {
+                "200": { "description": "Exported events" },
+                "400": { "description": "Invalid query parameters or unsupported format" },
+                "401": { "description": "API key required" }
+              }
+            }
+          },
           },
           {
             "name": "sort",

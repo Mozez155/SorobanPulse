@@ -12,6 +12,7 @@ use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
 use chrono::{DateTime, Utc};
 use futures::stream::{self, Stream, StreamExt};
 use reqwest;
+use secrecy::ExposeSecret;
 use serde_json::{json, Value};
 use sqlx::Row;
 use std::convert::Infallible;
@@ -1234,6 +1235,9 @@ fn filter_fields(
             "ledger_hash" => {
                 map.insert(col.to_string(), json!(event.ledger_hash));
             }
+            "anonymized" => {
+                map.insert(col.to_string(), json!(event.anonymized));
+            }
             "in_successful_call" => {
                 map.insert(col.to_string(), json!(event.in_successful_call));
             }
@@ -1243,9 +1247,6 @@ fn filter_fields(
             "schema_version" => {
                 map.insert(col.to_string(), json!(event.schema_version));
             }
-            "anonymized" => {
-                map.insert(col.to_string(), json!(event.anonymized));
-            }
             _ => {}
         }
     }
@@ -1253,6 +1254,24 @@ fn filter_fields(
 }
 
 /// Returns true if the client prefers NDJSON via the Accept header.
+fn extract_api_key_from_headers(headers: &HeaderMap) -> Option<&str> {
+    headers
+        .get("Authorization")
+        .and_then(|h| h.to_str().ok())
+        .and_then(|s| s.strip_prefix("Bearer "))
+        .or_else(|| headers.get("X-Api-Key").and_then(|h| h.to_str().ok()))
+}
+
+fn is_admin_request(headers: &HeaderMap, admin_api_keys: &[secrecy::SecretString]) -> bool {
+    extract_api_key_from_headers(headers)
+        .map(|provided_key| {
+            admin_api_keys
+                .iter()
+                .any(|expected| expected.expose_secret().as_str() == provided_key)
+        })
+        .unwrap_or(false)
+}
+
 fn accepts_ndjson(headers: &axum::http::HeaderMap) -> bool {
     headers
         .get(header::ACCEPT)
@@ -1295,6 +1314,8 @@ fn ndjson_response(events: impl Iterator<Item = Value>) -> Response<Body> {
         ("event_type" = Option<crate::models::EventType>, Query, description = "Filter by event type: contract, diagnostic, system"),
         ("from_ledger" = Option<i64>, Query, description = "Return events at or after this ledger"),
         ("to_ledger" = Option<i64>, Query, description = "Return events at or before this ledger"),
+        ("ledger_hash" = Option<String>, Query, description = "Filter by ledger hash"),
+        ("anonymized" = Option<bool>, Query, description = "Filter events by anonymized status (admin only)"),
         ("from_timestamp" = Option<String>, Query, description = "Return events at or after this timestamp (ISO 8601 format, e.g., 2026-03-14T00:00:00Z)"),
         ("to_timestamp" = Option<String>, Query, description = "Return events at or before this timestamp (ISO 8601 format, e.g., 2026-03-14T00:00:00Z)"),
         ("sort" = Option<String>, Query, description = "Sort order: asc (oldest first) or desc (newest first, default)"),
@@ -1356,6 +1377,12 @@ pub async fn get_events(
                 "from_timestamp must be <= to_timestamp".to_string(),
             ));
         }
+    }
+
+    if params.anonymized.is_some() && !is_admin_request(&headers, &state.config.admin_api_keys) {
+        return Err(AppError::Forbidden(
+            "anonymized filter requires admin privileges".to_string(),
+        ));
     }
 
     // Validate contract_id if provided
@@ -1438,6 +1465,14 @@ pub async fn get_events(
         }
         if params.to_ledger.is_some() {
             conditions.push(format!("ledger <= ${bind_idx}"));
+            bind_idx += 1;
+        }
+        if params.ledger_hash.is_some() {
+            conditions.push(format!("ledger_hash = ${bind_idx}"));
+            bind_idx += 1;
+        }
+        if params.anonymized.is_some() {
+            conditions.push(format!("anonymized = ${bind_idx}"));
             bind_idx += 1;
         }
         if params.in_successful_call.is_some() {
@@ -1535,6 +1570,12 @@ pub async fn get_events(
         }
         if let Some(tl) = params.to_ledger {
             q = q.bind(tl);
+        }
+        if let Some(ref hash) = params.ledger_hash {
+            q = q.bind(hash);
+        }
+        if let Some(anonymized) = params.anonymized {
+            q = q.bind(anonymized);
         }
         if let Some(isc) = params.in_successful_call {
             q = q.bind(isc);
@@ -1688,6 +1729,14 @@ pub async fn get_events(
         conditions.push(format!("ledger <= ${bind_idx}"));
         bind_idx += 1;
     }
+    if params.ledger_hash.is_some() {
+        conditions.push(format!("ledger_hash = ${bind_idx}"));
+        bind_idx += 1;
+    }
+    if params.anonymized.is_some() {
+        conditions.push(format!("anonymized = ${bind_idx}"));
+        bind_idx += 1;
+    }
     if params.in_successful_call.is_some() {
         conditions.push(format!("in_successful_call = ${bind_idx}"));
         bind_idx += 1;
@@ -1773,6 +1822,12 @@ pub async fn get_events(
     }
     if let Some(tl) = params.to_ledger {
         q = q.bind(tl);
+    }
+    if let Some(ref hash) = params.ledger_hash {
+        q = q.bind(hash);
+    }
+    if let Some(anonymized) = params.anonymized {
+        q = q.bind(anonymized);
     }
     if let Some(isc) = params.in_successful_call {
         q = q.bind(isc);
@@ -2012,6 +2067,7 @@ fn csv_escape_field(value: &str) -> String {
         ("from_ledger" = Option<i64>, Query, description = "Return events at or after this ledger"),
         ("to_ledger" = Option<i64>, Query, description = "Return events at or before this ledger"),
         ("contract_id" = Option<String>, Query, description = "Filter by contract ID"),
+        ("field_map" = Option<String>, Query, description = "Optional JSON object mapping source field names to target output names, e.g. {\"event_data\":\"raw_data\"}"),
     ),
     responses(
         (status = 200, description = "Exported events. \
@@ -2108,6 +2164,28 @@ pub async fn export_events(
 
     let rows = q.fetch_all(&state.pool).await?;
 
+    // Parse optional field_map parameter (JSON object string) which maps
+    // source field names -> target output field names.
+    let field_map: Option<std::collections::HashMap<String, String>> = if let Some(ref fm) = params.field_map {
+        match serde_json::from_str(fm) {
+            Ok(m) => Some(m),
+            Err(_) => {
+                return Err(AppError::Validation("field_map must be a JSON object mapping source field names to target field names".to_string()));
+            }
+        }
+    } else {
+        None
+    };
+
+    // Validate that all source fields in the map are valid allowed fields.
+    if let Some(ref fm) = field_map {
+        for src in fm.keys() {
+            if !models::PaginationParams::ALLOWED_FIELDS.contains(&src.as_str()) {
+                return Err(AppError::Validation(format!("unknown source field in field_map: {}", src)));
+            }
+        }
+    }
+
     // Get total count of available rows (for Content-Range header)
     let total_count: i64 = {
         let count_str = format!("SELECT COUNT(*) FROM events {}", where_clause);
@@ -2133,6 +2211,17 @@ pub async fn export_events(
     // JSON Lines format
     if want_jsonl {
         let mut jsonl = String::new();
+        // Default ordering of columns in export
+        let default_cols = [
+            "id",
+            "contract_id",
+            "event_type",
+            "tx_hash",
+            "ledger",
+            "timestamp",
+            "event_data",
+            "created_at",
+        ];
         for row in &rows {
             let id: uuid::Uuid = row.try_get("id")?;
             let contract_id: String = row.try_get("contract_id")?;
@@ -2143,16 +2232,22 @@ pub async fn export_events(
             let event_data: serde_json::Value = row.try_get("event_data")?;
             let created_at: chrono::DateTime<chrono::Utc> = row.try_get("created_at")?;
             
-            let obj = serde_json::json!({
-                "id": id,
-                "contract_id": contract_id,
-                "event_type": event_type,
-                "tx_hash": tx_hash,
-                "ledger": ledger,
-                "timestamp": timestamp,
-                "event_data": event_data,
-                "created_at": created_at,
-            });
+            let mut map = serde_json::Map::new();
+            for col in &default_cols {
+                let key = field_map.as_ref().and_then(|m| m.get(*col)).map(|s| s.as_str()).unwrap_or(*col);
+                match *col {
+                    "id" => { map.insert(key.to_string(), serde_json::json!(id)); }
+                    "contract_id" => { map.insert(key.to_string(), serde_json::json!(contract_id)); }
+                    "event_type" => { map.insert(key.to_string(), serde_json::json!(event_type)); }
+                    "tx_hash" => { map.insert(key.to_string(), serde_json::json!(tx_hash)); }
+                    "ledger" => { map.insert(key.to_string(), serde_json::json!(ledger)); }
+                    "timestamp" => { map.insert(key.to_string(), serde_json::json!(timestamp)); }
+                    "event_data" => { map.insert(key.to_string(), event_data.clone()); }
+                    "created_at" => { map.insert(key.to_string(), serde_json::json!(created_at)); }
+                    _ => {}
+                }
+            }
+            let obj = serde_json::Value::Object(map);
             
             jsonl.push_str(&obj.to_string());
             jsonl.push('\n');
@@ -2172,7 +2267,7 @@ pub async fn export_events(
 
     #[cfg(feature = "parquet")]
     if want_parquet {
-        use crate::parquet_export::{write_events_parquet, EventRow};
+        use crate::parquet_export::{write_events_parquet_with_field_map, EventRow};
         let event_rows: Vec<EventRow> = rows
             .iter()
             .map(|row| {
@@ -2190,7 +2285,8 @@ pub async fn export_events(
             .collect::<Result<_, _>>()?;
 
         let bytes =
-            write_events_parquet(&event_rows).map_err(|e| AppError::Internal(e.to_string()))?;
+            write_events_parquet_with_field_map(&event_rows, field_map.as_ref())
+            .map_err(|e| AppError::Internal(e.to_string()))?;
 
         return Ok(Response::builder()
             .status(StatusCode::OK)
@@ -2210,9 +2306,22 @@ pub async fn export_events(
     use bytes::Bytes;
     use futures::stream;
 
-    const CSV_HEADER: &str =
-        "id,contract_id,event_type,tx_hash,ledger,timestamp,event_data,created_at\n";
+    let default_cols = [
+        "id",
+        "contract_id",
+        "event_type",
+        "tx_hash",
+        "ledger",
+        "timestamp",
+        "event_data",
+        "created_at",
+    ];
 
+    let header_names: Vec<String> = default_cols
+        .iter()
+        .map(|c| field_map.as_ref().and_then(|m| m.get(*c)).cloned().unwrap_or_else(|| (*c).to_string()))
+        .collect();
+    let csv_header = format!("{}\n", header_names.join(","));
     // Collect row chunks; the header is the first chunk.
     let mut chunks: Vec<Result<Bytes, std::convert::Infallible>> =
         Vec::with_capacity(rows.len() + 1);
@@ -2231,17 +2340,22 @@ pub async fn export_events(
         // Serialize event_data to a JSON string, then escape it as a CSV field.
         let data_str = event_data.to_string();
 
-        let line = format!(
-            "{},{},{},{},{},{},{},{}\n",
-            csv_escape_field(&id.to_string()),
-            csv_escape_field(&contract_id),
-            csv_escape_field(&event_type),
-            csv_escape_field(&tx_hash),
-            ledger,
-            csv_escape_field(&timestamp.to_rfc3339()),
-            csv_escape_field(&data_str),
-            csv_escape_field(&created_at.to_rfc3339()),
-        );
+        // Build CSV line according to header order (mapped names don't affect values order)
+        let mut values: Vec<String> = Vec::with_capacity(default_cols.len());
+        for col in &default_cols {
+            match *col {
+                "id" => values.push(csv_escape_field(&id.to_string())),
+                "contract_id" => values.push(csv_escape_field(&contract_id)),
+                "event_type" => values.push(csv_escape_field(&event_type)),
+                "tx_hash" => values.push(csv_escape_field(&tx_hash)),
+                "ledger" => values.push(ledger.to_string()),
+                "timestamp" => values.push(csv_escape_field(&timestamp.to_rfc3339())),
+                "event_data" => values.push(csv_escape_field(&data_str)),
+                "created_at" => values.push(csv_escape_field(&created_at.to_rfc3339())),
+                _ => {}
+            }
+        }
+        let line = format!("{}\n", values.join(","));
         chunks.push(Ok(Bytes::from(line)));
     }
 
@@ -5269,6 +5383,59 @@ mod tests {
     }
 
     #[sqlx::test(migrations = "./migrations")]
+    async fn get_events_filter_by_ledger_hash(pool: PgPool) {
+        let app = create_test_router(pool.clone());
+
+        sqlx::query(
+            "INSERT INTO events (contract_id, event_type, tx_hash, ledger, timestamp, event_data, ledger_hash) \
+             VALUES ($1, $2, $3, $4, $5, $6, $7)",
+        )
+        .bind("C1234567890123456789012345678901234567890123456789012345")
+        .bind("contract")
+        .bind("a".repeat(64))
+        .bind(100_i64)
+        .bind(Utc::now())
+        .bind(json!({"test": "one"}))
+        .bind("abc123")
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        sqlx::query(
+            "INSERT INTO events (contract_id, event_type, tx_hash, ledger, timestamp, event_data, ledger_hash) \
+             VALUES ($1, $2, $3, $4, $5, $6, $7)",
+        )
+        .bind("C1234567890123456789012345678901234567890123456789012346")
+        .bind("contract")
+        .bind("b".repeat(64))
+        .bind(101_i64)
+        .bind(Utc::now())
+        .bind(json!({"test": "two"}))
+        .bind("def456")
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/v1/events?ledger_hash=abc123")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let v: Value = serde_json::from_slice(&body).unwrap();
+        let data = v["data"].as_array().unwrap();
+        assert_eq!(data.len(), 1);
+        assert_eq!(data[0]["ledger_hash"], json!("abc123"));
+        assert_eq!(data[0]["tx_hash"], json!("a".repeat(64)));
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
     async fn pagination_fields_filtering(pool: PgPool) {
         let app = create_test_router(pool.clone());
 
@@ -6573,6 +6740,87 @@ mod tests {
     }
 
     #[sqlx::test(migrations = "./migrations")]
+    async fn export_events_field_map_renames_csv_header(pool: PgPool) {
+        sqlx::query(
+            "INSERT INTO events (contract_id, event_type, tx_hash, ledger, timestamp, event_data)
+             VALUES ($1, $2, $3, $4, $5, $6)",
+        )
+        .bind("C1234567890123456789012345678901234567890123456789012345")
+        .bind("contract")
+        .bind("a".repeat(64))
+        .bind(1_i64)
+        .bind(Utc::now())
+        .bind(json!({"value": null, "topic": []}))
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let app = create_export_router(pool);
+        // URL-encoded JSON object: {"event_data":"raw_data","ledger":"ledger_seq"}
+        let fm = "%7B%22event_data%22%3A%22raw_data%22%2C%22ledger%22%3A%22ledger_seq%22%7D";
+        let uri = format!("/v1/events/export?field_map={fm}");
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri(uri)
+                    .header("Authorization", "Bearer test-key")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let csv = String::from_utf8(body.to_vec()).unwrap();
+        let mut lines = csv.lines();
+        assert_eq!(
+            lines.next().unwrap(),
+            "id,contract_id,event_type,tx_hash,ledger_seq,timestamp,raw_data,created_at"
+        );
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn export_events_field_map_renames_jsonl_keys(pool: PgPool) {
+        sqlx::query(
+            "INSERT INTO events (contract_id, event_type, tx_hash, ledger, timestamp, event_data)
+             VALUES ($1, $2, $3, $4, $5, $6)",
+        )
+        .bind("C1234567890123456789012345678901234567890123456789012345")
+        .bind("contract")
+        .bind("a".repeat(64))
+        .bind(1_i64)
+        .bind(Utc::now())
+        .bind(json!({"value": null, "topic": []}))
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let app = create_export_router(pool);
+        let fm = "%7B%22event_data%22%3A%22raw_data%22%7D";
+        let uri = format!("/v1/events/export?format=jsonl&field_map={fm}");
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri(uri)
+                    .header("Authorization", "Bearer test-key")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let s = String::from_utf8(body.to_vec()).unwrap();
+        let first = s.lines().next().unwrap();
+        let v: Value = serde_json::from_str(first).unwrap();
+        // Ensure mapped key exists and original key does not
+        assert!(v.get("raw_data").is_some());
+        assert!(v.get("event_data").is_none());
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
     async fn export_events_without_api_key_returns_error(pool: PgPool) {
         // Router with no api_keys configured
         let app = create_test_router(pool);
@@ -7218,6 +7466,80 @@ mod tests {
         let events = v["data"].as_array().unwrap();
         assert_eq!(events.len(), 1);
         assert_eq!(events[0]["event_data"], json!({"anonymized": true}));
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn get_events_anonymized_filter_requires_admin(pool: PgPool) {
+        let app = create_admin_auth_router(pool);
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/v1/events?anonymized=true")
+                    .header("Authorization", "Bearer regular-key")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn get_events_anonymized_filter_admin_key_allows_query(pool: PgPool) {
+        let event_id_true = Uuid::new_v4();
+        let event_id_false = Uuid::new_v4();
+        let contract_id = "C1234567890123456789012345678901234567890123456789012345";
+        let now = Utc::now();
+
+        sqlx::query(
+            "INSERT INTO events (id, contract_id, event_type, tx_hash, ledger, timestamp, event_data, anonymized)
+             VALUES ($1, $2, $3, $4, $5, $6, $7, TRUE)",
+        )
+        .bind(event_id_true)
+        .bind(contract_id)
+        .bind("contract")
+        .bind("a".repeat(64))
+        .bind(1_i64)
+        .bind(now)
+        .bind(json!({"value": 1}))
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        sqlx::query(
+            "INSERT INTO events (id, contract_id, event_type, tx_hash, ledger, timestamp, event_data, anonymized)
+             VALUES ($1, $2, $3, $4, $5, $6, $7, FALSE)",
+        )
+        .bind(event_id_false)
+        .bind(contract_id)
+        .bind("contract")
+        .bind("b".repeat(64))
+        .bind(2_i64)
+        .bind(now)
+        .bind(json!({"value": 2}))
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let app = create_admin_auth_router(pool);
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/v1/events?anonymized=true")
+                    .header("Authorization", "Bearer admin-secret")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let v: Value = serde_json::from_slice(&body).unwrap();
+        let events = v["data"].as_array().unwrap();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0]["anonymized"], json!(true));
     }
 
     // ── Diff endpoint tests ──────────────────────────────────────────────────

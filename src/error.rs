@@ -58,6 +58,9 @@ pub enum AppError {
     #[error("Validation error: {0}")]
     Validation(String),
 
+    #[error("Forbidden: {0}")]
+    Forbidden(String),
+
     #[error("Validation error with details")]
     ValidationWithDetails(String, Vec<ValidationErrorDetail>),
 
@@ -78,6 +81,12 @@ impl IntoResponse for AppError {
                 msg.clone(),
                 "VALIDATION_ERROR",
                 Some(errors.clone()),
+            ),
+            AppError::Forbidden(msg) => (
+                StatusCode::FORBIDDEN,
+                msg.clone(),
+                "FORBIDDEN",
+                None,
             ),
             AppError::Database(e) => {
                 if is_query_timeout(e) {
@@ -149,6 +158,12 @@ impl AppError {
                 "VALIDATION_ERROR",
                 Some(errors.clone()),
             ),
+            AppError::Forbidden(msg) => (
+                StatusCode::FORBIDDEN,
+                msg.clone(),
+                "FORBIDDEN",
+                None,
+            ),
             AppError::Database(e) => {
                 if is_query_timeout(e) {
                     let body = serde_json::json!({
@@ -165,6 +180,12 @@ impl AppError {
                     None,
                 )
             }
+            AppError::Forbidden(msg) => (
+                StatusCode::FORBIDDEN,
+                msg.clone(),
+                "FORBIDDEN".to_string(),
+                None,
+            ),
             AppError::Http(_) => (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 "internal server error".to_string(),

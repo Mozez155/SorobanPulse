@@ -78,6 +78,7 @@ pub struct PaginationParams {
     pub event_type: Option<EventType>,
     pub from_ledger: Option<i64>,
     pub to_ledger: Option<i64>,
+    pub ledger_hash: Option<String>,
     pub cursor: Option<String>,
     pub sort: Option<SortOrder>,
     /// Sort column: `ledger`, `timestamp`, or `created_at` (default: ledger)
@@ -85,6 +86,8 @@ pub struct PaginationParams {
     pub in_successful_call: Option<bool>,
     /// Filter by Soroban protocol schema version.
     pub schema_version: Option<i32>,
+    /// Filter by anonymized status. Requires an ADMIN_API_KEY.
+    pub anonymized: Option<bool>,
     /// Filter by the first topic symbol (uses topic_0_sym generated column index).
     pub topic_sym: Option<String>,
     /// Filter by topic array using JSONB containment (e.g., ?topic=["transfer"]).
@@ -197,6 +200,9 @@ pub struct ExportParams {
     pub contract_id: Option<String>,
     /// Output format: "csv" (default), "parquet", or "jsonl"
     pub format: Option<String>,
+    /// Optional JSON object mapping source field names to target field names.
+    /// Example: `{"event_data":"raw_data","ledger":"ledger_seq"}`
+    pub field_map: Option<String>,
 }
 
 /// Request body for POST /v1/admin/mask-events
@@ -499,13 +505,23 @@ mod tests {
             exact_count: None,
             fields: None,
             contract_id: None,
+            contract_ids: None,
             event_type: None,
             from_ledger: None,
             to_ledger: None,
+            ledger_hash: None,
             cursor: None,
             sort: None,
+            sort_by: None,
             in_successful_call: None,
-            contract_id: None,
+            schema_version: None,
+            anonymized: None,
+            topic_sym: None,
+            topic: None,
+            search: None,
+            from_timestamp: None,
+            to_timestamp: None,
+            compact: None,
         }
     }
 

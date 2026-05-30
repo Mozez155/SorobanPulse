@@ -39,6 +39,29 @@ pub fn create_schema() -> Arc<Schema> {
     ]))
 }
 
+/// Create a Parquet schema for events, allowing optional renaming of fields via `field_map`.
+pub fn create_schema_with_field_map(field_map: Option<&std::collections::HashMap<String, String>>) -> Arc<Schema> {
+    let id = field_map.and_then(|m| m.get("id")).map(|s| s.as_str()).unwrap_or("id");
+    let contract_id = field_map.and_then(|m| m.get("contract_id")).map(|s| s.as_str()).unwrap_or("contract_id");
+    let event_type = field_map.and_then(|m| m.get("event_type")).map(|s| s.as_str()).unwrap_or("event_type");
+    let tx_hash = field_map.and_then(|m| m.get("tx_hash")).map(|s| s.as_str()).unwrap_or("tx_hash");
+    let ledger = field_map.and_then(|m| m.get("ledger")).map(|s| s.as_str()).unwrap_or("ledger");
+    let timestamp = field_map.and_then(|m| m.get("timestamp_us")).map(|s| s.as_str()).unwrap_or("timestamp_us");
+    let event_data = field_map.and_then(|m| m.get("event_data")).map(|s| s.as_str()).unwrap_or("event_data");
+    let created_at = field_map.and_then(|m| m.get("created_at_us")).map(|s| s.as_str()).unwrap_or("created_at_us");
+
+    Arc::new(Schema::new(vec![
+        Field::new(id, DataType::Utf8, false),
+        Field::new(contract_id, DataType::Utf8, false),
+        Field::new(event_type, DataType::Utf8, false),
+        Field::new(tx_hash, DataType::Utf8, false),
+        Field::new(ledger, DataType::Int64, false),
+        Field::new(timestamp, DataType::Int64, false),
+        Field::new(event_data, DataType::Utf8, false),
+        Field::new(created_at, DataType::Int64, false),
+    ]))
+}
+
 /// Convert a batch of EventRows to a RecordBatch.
 pub fn events_to_batch(schema: &Arc<Schema>, events: &[EventRow]) -> Result<RecordBatch, parquet::errors::ParquetError> {
     let ids: ArrayRef = Arc::new(StringArray::from(
@@ -100,6 +123,22 @@ pub fn events_to_batch(schema: &Arc<Schema>, events: &[EventRow]) -> Result<Reco
 /// Serialize a slice of `EventRow` to Parquet bytes (legacy, for backward compatibility).
 pub fn write_events_parquet(events: &[EventRow]) -> Result<Vec<u8>, parquet::errors::ParquetError> {
     let schema = create_schema();
+    let batch = events_to_batch(&schema, events)?;
+
+    let props = WriterProperties::builder()
+        .set_compression(Compression::SNAPPY)
+        .build();
+
+    let mut buf = Vec::new();
+    let mut writer = ArrowWriter::try_new(&mut buf, schema, Some(props))?;
+    writer.write(&batch)?;
+    writer.close()?;
+    Ok(buf)
+}
+
+/// Write parquet bytes using an optional `field_map` to rename columns.
+pub fn write_events_parquet_with_field_map(events: &[EventRow], field_map: Option<&std::collections::HashMap<String,String>>) -> Result<Vec<u8>, parquet::errors::ParquetError> {
+    let schema = create_schema_with_field_map(field_map);
     let batch = events_to_batch(&schema, events)?;
 
     let props = WriterProperties::builder()
