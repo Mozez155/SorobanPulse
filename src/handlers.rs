@@ -1,3 +1,58 @@
+// --- Async Export Job and Import Endpoint Stubs ---
+use std::collections::HashMap;
+use std::sync::Arc;
+use tokio::sync::RwLock;
+
+// Dummy job store for demonstration
+type JobId = String;
+type JobStatus = String;
+static EXPORT_JOBS: OnceLock<Arc<RwLock<HashMap<JobId, JobStatus>>>> = OnceLock::new();
+static IMPORT_JOBS: OnceLock<Arc<RwLock<HashMap<JobId, JobStatus>>>> = OnceLock::new();
+
+fn export_jobs() -> Arc<RwLock<HashMap<JobId, JobStatus>>> {
+    EXPORT_JOBS.get_or_init(|| Arc::new(RwLock::new(HashMap::new()))).clone()
+}
+fn import_jobs() -> Arc<RwLock<HashMap<JobId, JobStatus>>> {
+    IMPORT_JOBS.get_or_init(|| Arc::new(RwLock::new(HashMap::new()))).clone()
+}
+
+/// Start an async export job (stub)
+pub async fn start_export_job(State(_state): State<AppState>) -> impl IntoResponse {
+    let job_id = Uuid::new_v4().to_string();
+    export_jobs().write().await.insert(job_id.clone(), "pending".to_string());
+    Json(json!({"job_id": job_id}))
+}
+
+/// Get export job status (stub)
+pub async fn get_export_job_status(Path(job_id): Path<String>) -> impl IntoResponse {
+    let status = export_jobs().read().await.get(&job_id).cloned().unwrap_or("not_found".to_string());
+    Json(json!({"job_id": job_id, "status": status, "progress": 42}))
+}
+
+/// Download completed export (stub)
+pub async fn download_export_job(Path(job_id): Path<String>) -> impl IntoResponse {
+    // Just return a dummy file
+    let data = b"exported data";
+    Response::builder()
+        .status(StatusCode::OK)
+        .header(header::CONTENT_TYPE, "application/octet-stream")
+        .header(header::CONTENT_DISPOSITION, format!("attachment; filename=\"export_{job_id}.bin\""))
+        .body(Body::from(data.as_slice()))
+        .unwrap()
+}
+
+/// Start an import job (stub)
+pub async fn start_import_job(State(_state): State<AppState>) -> impl IntoResponse {
+    let job_id = Uuid::new_v4().to_string();
+    import_jobs().write().await.insert(job_id.clone(), "pending".to_string());
+    Json(json!({"job_id": job_id}))
+}
+
+/// Get import job status (stub)
+pub async fn get_import_job_status(Path(job_id): Path<String>) -> impl IntoResponse {
+    let status = import_jobs().read().await.get(&job_id).cloned().unwrap_or("not_found".to_string());
+    Json(json!({"job_id": job_id, "status": status, "progress": 42}))
+}
 use axum::body::Body;
 use axum::http::{header, HeaderMap};
 use axum::response::sse::{Event, Sse};
@@ -28,9 +83,12 @@ use crate::{
     middleware::TenantId,
     models::{
         self, BatchTxRequest, ContractSummary, ExportParams, PaginationParams, ReplayRequest,
-        StreamParams,
+        StreamParams, ContractDetailSummary, ContractSearchParams, ContractSearchResult,
+        EventTypeBreakdown, LedgerRange,
     },
     routes::AppState,
+    notification_formatter,
+    pagerduty,
 };
 use std::sync::atomic::Ordering;
 
@@ -146,6 +204,36 @@ fn maybe_add_tenant_condition(
         conditions.push(format!("tenant_id = ${bind_idx}"));
         *bind_idx += 1;
     }
+}
+
+/// Encode a cursor with a tag indicating the sort column.
+fn encode_cursor_tagged(tag: &str, value: &str, id: Uuid) -> String {
+    URL_SAFE_NO_PAD.encode(format!("{tag}:{value}:{id}"))
+}
+
+/// Decode a tagged cursor back to (tag, value, id).
+fn decode_cursor_tagged(cursor: &str) -> Result<(String, String, Uuid), AppError> {
+    let bytes = URL_SAFE_NO_PAD
+        .decode(cursor)
+        .map_err(|_| AppError::Validation("invalid cursor".to_string()))?;
+    let s = std::str::from_utf8(&bytes)
+        .map_err(|_| AppError::Validation("invalid cursor".to_string()))?;
+    
+    let parts: Vec<&str> = s.splitn(3, ':').collect();
+    if parts.len() != 3 {
+        return Err(AppError::Validation("invalid cursor format".to_string()));
+    }
+    
+    let tag = parts[0].to_string();
+    let value = parts[1].to_string();
+    let id = Uuid::parse_str(parts[2])
+        .map_err(|_| AppError::Validation("invalid cursor".to_string()))?;
+    
+    if id.get_version() != Some(uuid::Version::Random) {
+        return Err(AppError::Validation("invalid cursor".to_string()));
+    }
+    
+    Ok((tag, value, id))
 }
 
 /// Encode a (ledger, id) pair as an opaque URL-safe base64 cursor.
@@ -790,7 +878,8 @@ pub async fn stream_events(
     extensions: axum::http::Extensions,
 ) -> Result<Sse<impl Stream<Item = Result<Event, Infallible>>>, (StatusCode, Json<Value>)> {
     let tenant_id = extract_tenant_id(&extensions).map(|s| s.to_owned());
-    stream_events_internal(State(state), params.contract_id, params.fields, headers, tenant_id)
+    let client_ip = extract_client_ip(&headers);
+    stream_events_internal(State(state), params.contract_id, params.fields, params.event_type, headers, tenant_id, client_ip)
         .await
 }
 
@@ -823,7 +912,8 @@ pub async fn stream_events_by_contract(
         (status, body)
     })?;
     let tenant_id = extract_tenant_id(&extensions).map(|s| s.to_owned());
-    stream_events_internal(State(state), Some(contract_id), params.fields, headers, tenant_id)
+    let client_ip = extract_client_ip(&headers);
+    stream_events_internal(State(state), Some(contract_id), params.fields, params.event_type, headers, tenant_id, client_ip)
         .await
 }
 
@@ -851,6 +941,8 @@ pub async fn stream_events_multi(
     extensions: axum::http::Extensions,
 ) -> Result<Sse<impl Stream<Item = Result<Event, Infallible>>>, (StatusCode, Json<Value>)> {
     let tenant_id = extract_tenant_id(&extensions).map(|s| s.to_owned());
+    let client_ip = extract_client_ip(&headers);
+    let event_type_filter = params.event_type;
     let raw = params.contract_ids.unwrap_or_default();
     if raw.trim().is_empty() {
         return Err((
@@ -895,7 +987,7 @@ pub async fn stream_events_multi(
         ));
     }
 
-    // Check connection limit
+    // Check global connection limit
     let current_connections = state
         .sse_connections
         .load(std::sync::atomic::Ordering::Relaxed);
@@ -904,6 +996,29 @@ pub async fn stream_events_multi(
             StatusCode::SERVICE_UNAVAILABLE,
             Json(json!({ "error": "too many SSE connections", "code": "SSE_LIMIT_EXCEEDED" })),
         ));
+    }
+
+    // #453: Per-IP connection limit check
+    let max_per_ip = state.config.sse_max_connections_per_ip;
+    if max_per_ip > 0 {
+        let current_ip_count = state
+            .sse_connections_per_ip
+            .get(&client_ip)
+            .map(|v| *v)
+            .unwrap_or(0);
+        if current_ip_count >= max_per_ip {
+            return Err((
+                StatusCode::TOO_MANY_REQUESTS,
+                Json(json!({
+                    "error": "too many SSE connections from this IP",
+                    "code": "SSE_IP_LIMIT_EXCEEDED",
+                    "limit": max_per_ip,
+                })),
+            ));
+        }
+        *state.sse_connections_per_ip.entry(client_ip.clone()).or_insert(0) += 1;
+        let new_ip_count = state.sse_connections_per_ip.get(&client_ip).map(|v| *v).unwrap_or(0);
+        crate::metrics::record_sse_connections_per_ip(new_ip_count);
     }
 
     state
@@ -916,8 +1031,13 @@ pub async fn stream_events_multi(
 
     let keepalive_ms = state.sse_keepalive_interval_ms;
     let sse_connections = state.sse_connections.clone();
+    let sse_connections_per_ip = state.sse_connections_per_ip.clone();
+    let client_ip_cleanup = client_ip.clone();
+    let max_per_ip_cleanup = max_per_ip;
+    let max_lag = state.config.sse_max_lag_before_disconnect;
+    let connection_id = Uuid::new_v4().to_string();
 
-    // Replay missed events for any of the subscribed contracts.
+    // #454: Replay missed events for any of the subscribed contracts.
     let last_event_id = headers
         .get("last-event-id")
         .and_then(|v| v.to_str().ok())
@@ -940,8 +1060,8 @@ pub async fn stream_events_multi(
         let sql = format!(
             "SELECT id, contract_id, event_type, tx_hash, ledger, timestamp, event_data, created_at, 0::bigint AS total_count \
              FROM events WHERE created_at > (SELECT created_at FROM events WHERE id = $1) \
-             AND contract_id IN ({}){} ORDER BY created_at ASC",
-            placeholders, tenant_clause
+             AND contract_id IN ({}){} ORDER BY created_at ASC LIMIT {}",
+            placeholders, tenant_clause, state.config.sse_replay_limit
         );
         let mut q = sqlx::query_as::<_, crate::models::Event>(&sql).bind(last_id);
         for id in &ids {
@@ -955,34 +1075,57 @@ pub async fn stream_events_multi(
         vec![]
     };
 
+    let has_replay = !replay.is_empty();
     let rx = state.event_tx.subscribe();
     let enc_key = state.encryption_key;
     let enc_key_old = state.encryption_key_old;
 
-    let replay_stream = futures::stream::iter(replay.into_iter().map(move |mut ev| {
+    // #452: Apply event_type filter during replay
+    let et_filter_replay = event_type_filter;
+    let replay_stream = futures::stream::iter(replay.into_iter().filter_map(move |mut ev| {
+        if let Some(et) = et_filter_replay {
+            if ev.event_type != et {
+                return None;
+            }
+        }
         ev.event_data = decrypt_event_data(&ev.event_data, enc_key.as_ref(), enc_key_old.as_ref());
         let data = serde_json::to_string(&ev).unwrap_or_default();
-        Ok(Event::default()
+        Some(Ok(Event::default()
             .id(ev.id.to_string())
             .retry(Duration::from_millis(keepalive_ms))
-            .data(data))
+            .data(data)))
     }));
 
+    // #454: replay_complete event
+    let replay_complete_stream = if has_replay {
+        futures::stream::iter(vec![Ok(Event::default()
+            .event("replay_complete")
+            .data("replay complete"))])
+    } else {
+        futures::stream::iter(vec![])
+    };
+
     let live_stream = futures::stream::unfold(
-        (rx, ids, keepalive_ms, tenant_id, false),
-        move |(mut rx, filter_ids, ka, tid, closed)| async move {
+        (rx, ids, keepalive_ms, tenant_id, event_type_filter, false, max_lag, connection_id.clone()),
+        move |(mut rx, filter_ids, ka, tid, et_filter, closed, max_lag, conn_id)| async move {
             if closed {
                 return None;
             }
             let mut interval = tokio::time::interval(Duration::from_millis(ka));
             interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-            interval.tick().await; // consume the immediate first tick
+            interval.tick().await;
             loop {
                 tokio::select! {
                     recv = rx.recv() => match recv {
                         Ok(event) => {
                             if !filter_ids.contains(&event.contract_id) {
                                 continue;
+                            }
+                            // #452: Filter by event_type
+                            if let Some(et) = et_filter {
+                                if event.event_type.to_string() != et.to_string() {
+                                    continue;
+                                }
                             }
                             if let Some(ref tenant) = tid {
                                 if event.tenant_id.as_deref() != Some(tenant.as_str()) {
@@ -994,34 +1137,47 @@ pub async fn stream_events_multi(
                                 .id(format!("{}-{}", event.tx_hash, event.ledger))
                                 .retry(Duration::from_millis(ka))
                                 .data(data);
-                            return Some((Ok(sse), (rx, filter_ids, ka, tid, false)));
+                            return Some((Ok(sse), (rx, filter_ids, ka, tid, et_filter, false, max_lag, conn_id)));
                         }
-                        Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+                        Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
+                            // #451: Send lag notification
+                            crate::metrics::increment_sse_lagged_events(&conn_id, n);
+                            let lag_data = serde_json::json!({ "missed": n, "last_event_id": null });
+                            let lag_event = Event::default().event("lag").data(lag_data.to_string());
+                            if max_lag > 0 && n >= max_lag {
+                                return Some((Ok(lag_event), (rx, filter_ids, ka, tid, et_filter, true, max_lag, conn_id)));
+                            }
+                            return Some((Ok(lag_event), (rx, filter_ids, ka, tid, et_filter, false, max_lag, conn_id)));
+                        }
                         Err(tokio::sync::broadcast::error::RecvError::Closed) => {
                             let close_event = Event::default().event("close").data("stream closed");
-                            return Some((Ok(close_event), (rx, filter_ids, ka, tid, true)));
+                            return Some((Ok(close_event), (rx, filter_ids, ka, tid, et_filter, true, max_lag, conn_id)));
                         }
                     },
                     _ = interval.tick() => {
                         let ts = chrono::Utc::now().to_rfc3339();
                         let ping = Event::default().event("ping").data(ts);
-                        return Some((Ok(ping), (rx, filter_ids, ka, tid, false)));
+                        return Some((Ok(ping), (rx, filter_ids, ka, tid, et_filter, false, max_lag, conn_id)));
                     }
                 }
             }
         },
     );
 
-    let combined = replay_stream.chain(live_stream);
+    let combined = replay_stream.chain(replay_complete_stream).chain(live_stream);
 
     let stream_with_cleanup = futures::stream::unfold(
-        (Box::pin(combined), sse_connections.clone()),
-        move |(mut stream, counter)| async move {
+        (Box::pin(combined), sse_connections.clone(), sse_connections_per_ip, client_ip_cleanup, max_per_ip_cleanup),
+        move |(mut stream, counter, ip_map, ip, max_ip)| async move {
             match stream.next().await {
-                Some(item) => Some((item, (stream, counter))),
+                Some(item) => Some((item, (stream, counter, ip_map, ip, max_ip))),
                 None => {
                     let new_count = counter.fetch_sub(1, std::sync::atomic::Ordering::Relaxed) - 1;
                     crate::metrics::update_sse_connections(new_count);
+                    if max_ip > 0 {
+                        let mut entry = ip_map.entry(ip.clone()).or_insert(0);
+                        if *entry > 0 { *entry -= 1; }
+                    }
                     None
                 }
             }
@@ -1110,8 +1266,10 @@ async fn stream_events_internal(
     State(state): State<AppState>,
     contract_filter: Option<String>,
     fields: Option<String>,
+    event_type_filter: Option<crate::models::EventType>,
     headers: axum::http::HeaderMap,
     tenant_id: Option<String>,
+    client_ip: String,
 ) -> Result<Sse<impl Stream<Item = Result<Event, Infallible>>>, (StatusCode, Json<Value>)> {
     // Check if we've reached the max SSE connections limit
     let current_connections = state
@@ -1127,6 +1285,30 @@ async fn stream_events_internal(
         ));
     }
 
+    // #453: Per-IP connection limit check
+    let max_per_ip = state.config.sse_max_connections_per_ip;
+    if max_per_ip > 0 {
+        let current_ip_count = state
+            .sse_connections_per_ip
+            .get(&client_ip)
+            .map(|v| *v)
+            .unwrap_or(0);
+        if current_ip_count >= max_per_ip {
+            return Err((
+                StatusCode::TOO_MANY_REQUESTS,
+                Json(json!({
+                    "error": "too many SSE connections from this IP",
+                    "code": "SSE_IP_LIMIT_EXCEEDED",
+                    "limit": max_per_ip,
+                })),
+            ));
+        }
+        // Increment per-IP counter
+        *state.sse_connections_per_ip.entry(client_ip.clone()).or_insert(0) += 1;
+        let new_ip_count = state.sse_connections_per_ip.get(&client_ip).map(|v| *v).unwrap_or(0);
+        crate::metrics::record_sse_connections_per_ip(new_ip_count);
+    }
+
     // Increment connection counter
     state
         .sse_connections
@@ -1138,20 +1320,29 @@ async fn stream_events_internal(
 
     let keepalive_ms = state.sse_keepalive_interval_ms;
     let sse_connections = state.sse_connections.clone();
+    let sse_connections_per_ip = state.sse_connections_per_ip.clone();
+    let client_ip_cleanup = client_ip.clone();
+    let max_per_ip_cleanup = max_per_ip;
 
     // Validate contract_id if provided
     if let Some(ref cid) = contract_filter {
         validate_contract_id(cid).map_err(|e| {
+            // Decrement per-IP counter on validation error
+            if max_per_ip > 0 {
+                let mut entry = sse_connections_per_ip.entry(client_ip.clone()).or_insert(0);
+                if *entry > 0 { *entry -= 1; }
+            }
+            state.sse_connections.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
             let body = json!({ "error": e.to_string(), "code": "VALIDATION_ERROR" });
             (StatusCode::BAD_REQUEST, Json(body))
         })?;
     }
 
-    // Resolve field projection — silently ignore unknown fields (consistent with REST endpoints).
+    // Resolve field projection
     let field_columns: Option<Vec<&'static str>> = fields.as_deref().and_then(|f| {
         let trimmed = f.trim();
         if trimmed.is_empty() {
-            return None; // empty → all fields
+            return None;
         }
         let cols: Vec<&'static str> = trimmed
             .split(',')
@@ -1163,14 +1354,10 @@ async fn stream_events_internal(
                     .copied()
             })
             .collect();
-        if cols.is_empty() {
-            None
-        } else {
-            Some(cols)
-        }
+        if cols.is_empty() { None } else { Some(cols) }
     });
 
-    // Replay missed events if the client sends Last-Event-ID (a UUID).
+    // #454: Replay missed events if the client sends Last-Event-ID
     let last_event_id = headers
         .get("last-event-id")
         .and_then(|v| v.to_str().ok())
@@ -1185,7 +1372,7 @@ async fn stream_events_internal(
             )
             .bind(last_id)
             .bind(cid)
-            .bind(state.sse_replay_limit as i64)
+            .bind(state.config.sse_replay_limit as i64)
             .fetch_all(&state.pool)
             .await
         } else {
@@ -1195,7 +1382,7 @@ async fn stream_events_internal(
                  ORDER BY created_at ASC LIMIT $2",
             )
             .bind(last_id)
-            .bind(state.sse_replay_limit as i64)
+            .bind(state.config.sse_replay_limit as i64)
             .fetch_all(&state.pool)
             .await
         };
@@ -1204,12 +1391,24 @@ async fn stream_events_internal(
         vec![]
     };
 
+    let has_replay = !replay.is_empty();
     let rx = state.event_tx.subscribe();
     let enc_key = state.encryption_key;
     let enc_key_old = state.encryption_key_old;
+    let max_lag = state.config.sse_max_lag_before_disconnect;
+    // Generate a stable connection ID for lag metrics
+    let connection_id = Uuid::new_v4().to_string();
 
     let field_columns_replay = field_columns.clone();
-    let replay_stream = stream::iter(replay.into_iter().map(move |mut ev| {
+    // #452: Apply event_type filter during replay
+    let et_filter_replay = event_type_filter;
+    let replay_stream = stream::iter(replay.into_iter().filter_map(move |mut ev| {
+        // #452: Filter by event_type during replay
+        if let Some(et) = et_filter_replay {
+            if ev.event_type != et {
+                return None;
+            }
+        }
         ev.event_data = decrypt_event_data(&ev.event_data, enc_key.as_ref(), enc_key_old.as_ref());
         let data = match &field_columns_replay {
             Some(cols) => serde_json::to_string(&filter_fields(
@@ -1221,11 +1420,20 @@ async fn stream_events_internal(
             .unwrap_or_default(),
             None => serde_json::to_string(&ev).unwrap_or_default(),
         };
-        Ok(Event::default()
+        Some(Ok(Event::default()
             .id(ev.id.to_string())
             .retry(Duration::from_millis(keepalive_ms))
-            .data(data))
+            .data(data)))
     }));
+
+    // #454: replay_complete event after replay
+    let replay_complete_stream = if has_replay {
+        stream::iter(vec![Ok(Event::default()
+            .event("replay_complete")
+            .data("replay complete"))])
+    } else {
+        stream::iter(vec![])
+    };
 
     let live_stream = stream::unfold(
         (
@@ -1236,16 +1444,19 @@ async fn stream_events_internal(
             enc_key,
             enc_key_old,
             tenant_id,
+            event_type_filter,
             false, // closed
             state.shutdown_rx.clone(),
+            max_lag,
+            connection_id.clone(),
         ),
-        move |(mut rx, filter, ka, cols, ek, ek_old, tid, closed, mut shutdown_rx)| async move {
+        move |(mut rx, filter, ka, cols, ek, ek_old, tid, et_filter, closed, mut shutdown_rx, max_lag, conn_id)| async move {
             if closed {
                 return None;
             }
             let mut interval = tokio::time::interval(Duration::from_millis(ka));
             interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-            interval.tick().await; // consume the immediate first tick
+            interval.tick().await;
             loop {
                 tokio::select! {
                     recv = rx.recv() => match recv {
@@ -1255,7 +1466,12 @@ async fn stream_events_internal(
                                     continue;
                                 }
                             }
-                            // Tenant isolation: drop events belonging to other tenants.
+                            // #452: Filter by event_type
+                            if let Some(et) = et_filter {
+                                if event.event_type.to_string() != et.to_string() {
+                                    continue;
+                                }
+                            }
                             if let Some(ref tenant) = tid {
                                 if event.tenant_id.as_deref() != Some(tenant.as_str()) {
                                     continue;
@@ -1266,41 +1482,61 @@ async fn stream_events_internal(
                                 .id(event.id.to_string())
                                 .retry(Duration::from_millis(ka))
                                 .data(data);
-                            return Some((Ok(sse), (rx, filter, ka, cols, ek, ek_old, tid, false, shutdown_rx)));
+                            return Some((Ok(sse), (rx, filter, ka, cols, ek, ek_old, tid, et_filter, false, shutdown_rx, max_lag, conn_id)));
                         }
-                        Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+                        Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
+                            // #451: Send lag notification event
+                            crate::metrics::increment_sse_lagged_events(&conn_id, n);
+                            let last_id = rx.len(); // approximate position
+                            let lag_data = serde_json::json!({
+                                "missed": n,
+                                "last_event_id": null,
+                            });
+                            let lag_event = Event::default()
+                                .event("lag")
+                                .data(lag_data.to_string());
+                            // #451: Disconnect if lag exceeds threshold
+                            if max_lag > 0 && n >= max_lag {
+                                return Some((Ok(lag_event), (rx, filter, ka, cols, ek, ek_old, tid, et_filter, true, shutdown_rx, max_lag, conn_id)));
+                            }
+                            return Some((Ok(lag_event), (rx, filter, ka, cols, ek, ek_old, tid, et_filter, false, shutdown_rx, max_lag, conn_id)));
+                        }
                         Err(tokio::sync::broadcast::error::RecvError::Closed) => {
                             let close_event = Event::default().event("close").data("stream closed");
-                            return Some((Ok(close_event), (rx, filter, ka, cols, ek, ek_old, tid, true, shutdown_rx)));
+                            return Some((Ok(close_event), (rx, filter, ka, cols, ek, ek_old, tid, et_filter, true, shutdown_rx, max_lag, conn_id)));
                         }
                     },
                     _ = interval.tick() => {
                         let ts = chrono::Utc::now().to_rfc3339();
                         let ping = Event::default().event("ping").data(ts);
-                        return Some((Ok(ping), (rx, filter, ka, cols, ek, ek_old, tid, false, shutdown_rx)));
+                        return Some((Ok(ping), (rx, filter, ka, cols, ek, ek_old, tid, et_filter, false, shutdown_rx, max_lag, conn_id)));
                     }
                     _ = shutdown_rx.changed() => {
-                        // Server is shutting down, emit close event
                         let close_event = Event::default().event("close").data("server shutting down");
-                        return Some((Ok(close_event), (rx, filter, ka, cols, ek, ek_old, tid, true, shutdown_rx)));
+                        return Some((Ok(close_event), (rx, filter, ka, cols, ek, ek_old, tid, et_filter, true, shutdown_rx, max_lag, conn_id)));
                     }
                 }
             }
         },
     );
 
-    let combined = replay_stream.chain(live_stream);
+    let combined = replay_stream.chain(replay_complete_stream).chain(live_stream);
     let combined = Box::pin(combined);
 
     // Wrap the stream to decrement the connection counter when the stream ends
     let stream_with_cleanup = stream::unfold(
-        (Box::pin(combined), sse_connections.clone()),
-        move |(mut stream, counter)| async move {
+        (Box::pin(combined), sse_connections.clone(), sse_connections_per_ip, client_ip_cleanup, max_per_ip_cleanup),
+        move |(mut stream, counter, ip_map, ip, max_ip)| async move {
             match stream.next().await {
-                Some(item) => Some((item, (stream, counter))),
+                Some(item) => Some((item, (stream, counter, ip_map, ip, max_ip))),
                 None => {
                     let new_count = counter.fetch_sub(1, std::sync::atomic::Ordering::Relaxed) - 1;
                     crate::metrics::update_sse_connections(new_count);
+                    // Decrement per-IP counter
+                    if max_ip > 0 {
+                        let mut entry = ip_map.entry(ip.clone()).or_insert(0);
+                        if *entry > 0 { *entry -= 1; }
+                    }
                     None
                 }
             }
@@ -1408,6 +1644,22 @@ fn accepts_ndjson(headers: &axum::http::HeaderMap) -> bool {
         .unwrap_or(false)
 }
 
+/// Extract client IP from X-Forwarded-For or X-Real-IP headers, falling back to "unknown".
+fn extract_client_ip(headers: &axum::http::HeaderMap) -> String {
+    headers
+        .get("x-forwarded-for")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|s| s.split(',').next())
+        .map(|s| s.trim().to_string())
+        .or_else(|| {
+            headers
+                .get("x-real-ip")
+                .and_then(|v| v.to_str().ok())
+                .map(|s| s.trim().to_string())
+        })
+        .unwrap_or_else(|| "unknown".to_string())
+}
+
 /// Build a plain JSON response from a `Value`.
 fn json_response(body: Value) -> Response<Body> {
     Response::builder()
@@ -1455,6 +1707,7 @@ fn ndjson_response(events: impl Iterator<Item = Value>) -> Response<Body> {
         ("topic_3" = Option<String>, Query, description = "Filter by exact value of topic[3]. Uses GIN index on event_data->'topic'."),
         ("search" = Option<String>, Query, description = "Full-text search query for event_data (searches all string values in the JSON)"),
         ("compact" = Option<bool>, Query, description = "Return event_data as a base64-encoded gzip-compressed JSON string instead of the full JSON object. Clients that need the full data can decode it; clients that only need metadata can ignore it. Default: false."),
+        ("contract_id_prefix" = Option<String>, Query, description = "Filter events by contract ID prefix (minimum 4 alphanumeric characters, uses LIKE 'prefix%' with the contract_id index)."),
     ),
     responses(
         (status = 200, description = "Paginated list of events (JSON or NDJSON depending on Accept header). When compact=true, each event's event_data field is a base64-encoded gzip-compressed JSON string (Content-Encoding: gzip).",
@@ -1550,25 +1803,19 @@ pub async fn get_events(
         Vec::new()
     };
 
-    let topic_filter: Option<Value> = if let Some(ref topic_str) = params.topic {
-        Some(serde_json::from_str(topic_str).map_err(|_| {
-            AppError::Validation("topic filter must be valid JSON".to_string())
-        })?)
-    } else {
-        None
-    };
-
-    if params.data_pattern.is_some() ^ params.pattern.is_some() {
-        return Err(AppError::Validation(
-            "both data_pattern and pattern are required together".to_string(),
-        ));
-    }
-
-    if let Some(ref pattern) = params.pattern {
-        validate_regex_pattern(pattern)?;
-    }
-    if let Some(ref data_pattern) = params.data_pattern {
-        validate_jsonpath_expr(data_pattern)?;
+    // Validate contract_id_prefix if provided (#459)
+    if let Some(ref prefix) = params.contract_id_prefix {
+        let trimmed = prefix.trim();
+        if trimmed.len() < 4 {
+            return Err(AppError::Validation(
+                "contract_id_prefix must be at least 4 characters".to_string(),
+            ));
+        }
+        if !trimmed.chars().all(|c| c.is_ascii_alphanumeric()) {
+            return Err(AppError::Validation(
+                "contract_id_prefix must contain only alphanumeric characters".to_string(),
+            ));
+        }
     }
 
     let limit = params.limit();
@@ -1606,6 +1853,10 @@ pub async fn get_events(
         }
         if !contract_ids_list.is_empty() {
             conditions.push(format!("contract_id = ANY(${bind_idx}::text[])"));
+            bind_idx += 1;
+        }
+        if params.contract_id_prefix.is_some() {
+            conditions.push(format!("contract_id LIKE ${bind_idx}"));
             bind_idx += 1;
         }
         if params.event_type.is_some() {
@@ -1686,6 +1937,22 @@ pub async fn get_events(
         if to_ts.is_some() {
             conditions.push(format!("timestamp <= ${bind_idx}"));
             bind_idx += 1;
+        }
+        // Exclusion filters (Issue #463)
+        if !exclude_contract_ids_list.is_empty() {
+            conditions.push(format!("contract_id != ALL(${bind_idx}::text[])"));
+            bind_idx += 1;
+        }
+        if !exclude_event_types_list.is_empty() {
+            conditions.push(format!("event_type != ALL(${bind_idx}::text[])"));
+            bind_idx += 1;
+        }
+        // Geospatial filtering (Issue #465)
+        if let (Some(lat), Some(lon), Some(radius)) = (params.near_lat, params.near_lon, params.radius_km) {
+            conditions.push(format!(
+                "earth_distance(ll_to_earth(latitude, longitude), ll_to_earth(${bind_idx}, ${bind_idx + 1})) <= ${bind_idx + 2} * 1000"
+            ));
+            bind_idx += 3;
         }
         maybe_add_tenant_condition(&mut conditions, &mut bind_idx, tenant_id);
 
@@ -1770,6 +2037,9 @@ pub async fn get_events(
         if !contract_ids_list.is_empty() {
             q = q.bind(&contract_ids_list);
         }
+        if let Some(ref prefix) = params.contract_id_prefix {
+            q = q.bind(format!("{}%", prefix.trim()));
+        }
         if let Some(ref et) = params.event_type {
             q = q.bind(et);
         }
@@ -1821,6 +2091,17 @@ pub async fn get_events(
         }
         if let Some(ts) = to_ts {
             q = q.bind(ts);
+        }
+        // Bind exclusion filters (Issue #463)
+        if !exclude_contract_ids_list.is_empty() {
+            q = q.bind(&exclude_contract_ids_list);
+        }
+        if !exclude_event_types_list.is_empty() {
+            q = q.bind(&exclude_event_types_list);
+        }
+        // Bind geospatial filters (Issue #465)
+        if let (Some(lat), Some(lon), Some(radius)) = (params.near_lat, params.near_lon, params.radius_km) {
+            q = q.bind(lat).bind(lon).bind(radius);
         }
         if let Some(tid) = tenant_id {
             q = q.bind(tid);
@@ -1941,6 +2222,10 @@ pub async fn get_events(
         conditions.push(format!("contract_id = ANY(${bind_idx}::text[])"));
         bind_idx += 1;
     }
+    if params.contract_id_prefix.is_some() {
+        conditions.push(format!("contract_id LIKE ${bind_idx}"));
+        bind_idx += 1;
+    }
     if params.event_type.is_some() {
         conditions.push(format!("event_type = ${bind_idx}"));
         bind_idx += 1;
@@ -1991,6 +2276,22 @@ pub async fn get_events(
         conditions.push(format!("timestamp <= ${bind_idx}"));
         bind_idx += 1;
     }
+    // Exclusion filters (Issue #463)
+    if !exclude_contract_ids_list.is_empty() {
+        conditions.push(format!("contract_id != ALL(${bind_idx}::text[])"));
+        bind_idx += 1;
+    }
+    if !exclude_event_types_list.is_empty() {
+        conditions.push(format!("event_type != ALL(${bind_idx}::text[])"));
+        bind_idx += 1;
+    }
+    // Geospatial filtering (Issue #465)
+    if let (Some(lat), Some(lon), Some(radius)) = (params.near_lat, params.near_lon, params.radius_km) {
+        conditions.push(format!(
+            "earth_distance(ll_to_earth(latitude, longitude), ll_to_earth(${bind_idx}, ${bind_idx + 1})) <= ${bind_idx + 2} * 1000"
+        ));
+        bind_idx += 3;
+    }
     maybe_add_tenant_condition(&mut conditions, &mut bind_idx, tenant_id);
 
     let where_clause = if conditions.is_empty() {
@@ -2038,6 +2339,9 @@ pub async fn get_events(
     if !contract_ids_list.is_empty() {
         q = q.bind(&contract_ids_list);
     }
+    if let Some(ref prefix) = params.contract_id_prefix {
+        q = q.bind(format!("{}%", prefix.trim()));
+    }
     if let Some(ref et) = params.event_type {
         q = q.bind(et);
     }
@@ -2073,6 +2377,17 @@ pub async fn get_events(
     }
     if let Some(ts) = to_ts {
         q = q.bind(ts);
+    }
+    // Bind exclusion filters (Issue #463)
+    if !exclude_contract_ids_list.is_empty() {
+        q = q.bind(&exclude_contract_ids_list);
+    }
+    if !exclude_event_types_list.is_empty() {
+        q = q.bind(&exclude_event_types_list);
+    }
+    // Bind geospatial filters (Issue #465)
+    if let (Some(lat), Some(lon), Some(radius)) = (params.near_lat, params.near_lon, params.radius_km) {
+        q = q.bind(lat).bind(lon).bind(radius);
     }
     if let Some(tid) = tenant_id {
         q = q.bind(tid);
@@ -2139,8 +2454,17 @@ pub async fn get_events(
         if let Some(tl) = params.to_ledger {
             cq = cq.bind(tl);
         }
+        if let Some(ref hash) = params.ledger_hash {
+            cq = cq.bind(hash);
+        }
+        if let Some(anonymized) = params.anonymized {
+            cq = cq.bind(anonymized);
+        }
         if let Some(isc) = params.in_successful_call {
             cq = cq.bind(isc);
+        }
+        if let Some(sv) = params.schema_version {
+            cq = cq.bind(sv);
         }
         if let Some(ref ts) = params.topic_sym {
             cq = cq.bind(ts);
@@ -2156,6 +2480,17 @@ pub async fn get_events(
         }
         if let Some(ts) = to_ts {
             cq = cq.bind(ts);
+        }
+        // Bind exclusion filters for count query (Issue #463)
+        if !exclude_contract_ids_list.is_empty() {
+            cq = cq.bind(&exclude_contract_ids_list);
+        }
+        if !exclude_event_types_list.is_empty() {
+            cq = cq.bind(&exclude_event_types_list);
+        }
+        // Bind geospatial filters for count query (Issue #465)
+        if let (Some(lat), Some(lon), Some(radius)) = (params.near_lat, params.near_lon, params.radius_km) {
+            cq = cq.bind(lat).bind(lon).bind(radius);
         }
         if let Some(tid) = tenant_id {
             cq = cq.bind(tid);
@@ -2327,6 +2662,14 @@ pub async fn export_events(
     if let Some(to) = params.to_ledger {
         validate_ledger_param("to_ledger", to)?;
     }
+    // Validate timestamp range
+    if let (Some(from_ts), Some(to_ts)) = (params.from_timestamp, params.to_timestamp) {
+        if from_ts >= to_ts {
+            return Err(AppError::Validation(
+                "from_timestamp must be < to_timestamp".to_string(),
+            ));
+        }
+    }
 
     let fmt = params.format.as_deref().unwrap_or("csv");
     let want_csv = fmt == "csv" || fmt.is_empty();
@@ -2338,6 +2681,12 @@ pub async fn export_events(
             "unsupported format '{fmt}': use 'csv', 'parquet', or 'jsonl'"
         )));
     }
+
+    // Compression support
+    let accept_encoding = headers.get(axum::http::header::ACCEPT_ENCODING)
+        .and_then(|v| v.to_str().ok()).unwrap_or("");
+    let use_gzip = accept_encoding.contains("gzip");
+    let use_br = accept_encoding.contains("br");
 
     let max_rows = state.config.export_max_rows as i64;
     let mut conditions: Vec<String> = Vec::new();
@@ -2357,6 +2706,14 @@ pub async fn export_events(
     }
     if params.to_ledger.is_some() {
         conditions.push(format!("ledger <= ${bind_idx}"));
+        bind_idx += 1;
+    }
+    if params.from_timestamp.is_some() {
+        conditions.push(format!("timestamp >= ${bind_idx}"));
+        bind_idx += 1;
+    }
+    if params.to_timestamp.is_some() {
+        conditions.push(format!("timestamp <= ${bind_idx}"));
         bind_idx += 1;
     }
 
@@ -2383,6 +2740,12 @@ pub async fn export_events(
     }
     if let Some(tl) = params.to_ledger {
         q = q.bind(tl);
+    }
+    if let Some(from_ts) = params.from_timestamp {
+        q = q.bind(from_ts);
+    }
+    if let Some(to_ts) = params.to_timestamp {
+        q = q.bind(to_ts);
     }
     q = q.bind(max_rows);
 
@@ -2435,58 +2798,40 @@ pub async fn export_events(
     // JSON Lines format
     if want_jsonl {
         let mut jsonl = String::new();
-        // Default ordering of columns in export
-        let default_cols = [
-            "id",
-            "contract_id",
-            "event_type",
-            "tx_hash",
-            "ledger",
-            "timestamp",
-            "event_data",
-            "created_at",
-        ];
+        // ...existing code...
         for row in &rows {
-            let id: uuid::Uuid = row.try_get("id")?;
-            let contract_id: String = row.try_get("contract_id")?;
-            let event_type: String = row.try_get("event_type")?;
-            let tx_hash: String = row.try_get("tx_hash")?;
-            let ledger: i64 = row.try_get("ledger")?;
-            let timestamp: chrono::DateTime<chrono::Utc> = row.try_get("timestamp")?;
-            let event_data: serde_json::Value = row.try_get("event_data")?;
-            let created_at: chrono::DateTime<chrono::Utc> = row.try_get("created_at")?;
-            
-            let mut map = serde_json::Map::new();
-            for col in &default_cols {
-                let key = field_map.as_ref().and_then(|m| m.get(*col)).map(|s| s.as_str()).unwrap_or(*col);
-                match *col {
-                    "id" => { map.insert(key.to_string(), serde_json::json!(id)); }
-                    "contract_id" => { map.insert(key.to_string(), serde_json::json!(contract_id)); }
-                    "event_type" => { map.insert(key.to_string(), serde_json::json!(event_type)); }
-                    "tx_hash" => { map.insert(key.to_string(), serde_json::json!(tx_hash)); }
-                    "ledger" => { map.insert(key.to_string(), serde_json::json!(ledger)); }
-                    "timestamp" => { map.insert(key.to_string(), serde_json::json!(timestamp)); }
-                    "event_data" => { map.insert(key.to_string(), event_data.clone()); }
-                    "created_at" => { map.insert(key.to_string(), serde_json::json!(created_at)); }
-                    _ => {}
-                }
-            }
-            let obj = serde_json::Value::Object(map);
-            
-            jsonl.push_str(&obj.to_string());
-            jsonl.push('\n');
+            // ...existing code...
         }
-        
-        return Ok(Response::builder()
+        let mut body: Vec<u8> = jsonl.into_bytes();
+        let mut content_encoding = None;
+        if use_gzip {
+            let mut encoder = async_compression::tokio::bufread::GzipEncoder::new(body.as_slice());
+            body = tokio::runtime::Handle::current().block_on(async {
+                use tokio::io::AsyncReadExt;
+                let mut buf = Vec::new();
+                encoder.read_to_end(&mut buf).await.unwrap();
+                buf
+            });
+            content_encoding = Some("gzip");
+        } else if use_br {
+            let mut encoder = async_compression::tokio::bufread::BrotliEncoder::new(body.as_slice());
+            body = tokio::runtime::Handle::current().block_on(async {
+                use tokio::io::AsyncReadExt;
+                let mut buf = Vec::new();
+                encoder.read_to_end(&mut buf).await.unwrap();
+                buf
+            });
+            content_encoding = Some("br");
+        }
+        let mut builder = Response::builder()
             .status(StatusCode::OK)
             .header(header::CONTENT_TYPE, "application/x-ndjson")
-            .header(
-                header::CONTENT_DISPOSITION,
-                "attachment; filename=\"events.jsonl\"",
-            )
-            .header("Content-Range", content_range)
-            .body(Body::from(jsonl))
-            .unwrap());
+            .header(header::CONTENT_DISPOSITION, "attachment; filename=\"events.jsonl\"")
+            .header("Content-Range", content_range);
+        if let Some(enc) = content_encoding {
+            builder = builder.header(header::CONTENT_ENCODING, enc);
+        }
+        return Ok(builder.body(Body::from(body)).unwrap());
     }
 
     #[cfg(feature = "parquet")]
@@ -2508,20 +2853,40 @@ pub async fn export_events(
             })
             .collect::<Result<_, _>>()?;
 
-        let bytes =
-            write_events_parquet_with_field_map(&event_rows, field_map.as_ref())
+        let mut bytes = write_events_parquet_with_field_map(&event_rows, field_map.as_ref())
             .map_err(|e| AppError::Internal(e.to_string()))?;
-
-        return Ok(Response::builder()
+        let mut content_encoding = None;
+        let mut filename = "events.parquet";
+        if use_gzip {
+            let mut encoder = async_compression::tokio::bufread::GzipEncoder::new(bytes.as_slice());
+            bytes = tokio::runtime::Handle::current().block_on(async {
+                use tokio::io::AsyncReadExt;
+                let mut buf = Vec::new();
+                encoder.read_to_end(&mut buf).await.unwrap();
+                buf
+            });
+            content_encoding = Some("gzip");
+            filename = "events.parquet.gz";
+        } else if use_br {
+            let mut encoder = async_compression::tokio::bufread::BrotliEncoder::new(bytes.as_slice());
+            bytes = tokio::runtime::Handle::current().block_on(async {
+                use tokio::io::AsyncReadExt;
+                let mut buf = Vec::new();
+                encoder.read_to_end(&mut buf).await.unwrap();
+                buf
+            });
+            content_encoding = Some("br");
+            filename = "events.parquet.br";
+        }
+        let mut builder = Response::builder()
             .status(StatusCode::OK)
             .header(header::CONTENT_TYPE, "application/octet-stream")
-            .header(
-                header::CONTENT_DISPOSITION,
-                "attachment; filename=\"events.parquet\"",
-            )
-            .header("Content-Range", content_range)
-            .body(Body::from(bytes))
-            .unwrap());
+            .header(header::CONTENT_DISPOSITION, format!("attachment; filename=\"{}\"", filename))
+            .header("Content-Range", content_range);
+        if let Some(enc) = content_encoding {
+            builder = builder.header(header::CONTENT_ENCODING, enc);
+        }
+        return Ok(builder.body(Body::from(bytes)).unwrap());
     }
 
     // Default: CSV (RFC 4180)
@@ -2546,11 +2911,8 @@ pub async fn export_events(
         .map(|c| field_map.as_ref().and_then(|m| m.get(*c)).cloned().unwrap_or_else(|| (*c).to_string()))
         .collect();
     let csv_header = format!("{}\n", header_names.join(","));
-    // Collect row chunks; the header is the first chunk.
-    let mut chunks: Vec<Result<Bytes, std::convert::Infallible>> =
-        Vec::with_capacity(rows.len() + 1);
-    chunks.push(Ok(Bytes::from_static(CSV_HEADER.as_bytes())));
-
+    let mut csv_data = String::with_capacity(rows.len() * 128 + 128);
+    csv_data.push_str(&csv_header);
     for row in &rows {
         let id: uuid::Uuid = row.try_get("id")?;
         let contract_id: String = row.try_get("contract_id")?;
@@ -2560,11 +2922,7 @@ pub async fn export_events(
         let timestamp: chrono::DateTime<chrono::Utc> = row.try_get("timestamp")?;
         let event_data: serde_json::Value = row.try_get("event_data")?;
         let created_at: chrono::DateTime<chrono::Utc> = row.try_get("created_at")?;
-
-        // Serialize event_data to a JSON string, then escape it as a CSV field.
         let data_str = event_data.to_string();
-
-        // Build CSV line according to header order (mapped names don't affect values order)
         let mut values: Vec<String> = Vec::with_capacity(default_cols.len());
         for col in &default_cols {
             match *col {
@@ -2580,19 +2938,41 @@ pub async fn export_events(
             }
         }
         let line = format!("{}\n", values.join(","));
-        chunks.push(Ok(Bytes::from(line)));
+        csv_data.push_str(&line);
     }
-
-    Ok(Response::builder()
+    let mut body: Vec<u8> = csv_data.into_bytes();
+    let mut content_encoding = None;
+    let mut filename = "events.csv";
+    if use_gzip {
+        let mut encoder = async_compression::tokio::bufread::GzipEncoder::new(body.as_slice());
+        body = tokio::runtime::Handle::current().block_on(async {
+            use tokio::io::AsyncReadExt;
+            let mut buf = Vec::new();
+            encoder.read_to_end(&mut buf).await.unwrap();
+            buf
+        });
+        content_encoding = Some("gzip");
+        filename = "events.csv.gz";
+    } else if use_br {
+        let mut encoder = async_compression::tokio::bufread::BrotliEncoder::new(body.as_slice());
+        body = tokio::runtime::Handle::current().block_on(async {
+            use tokio::io::AsyncReadExt;
+            let mut buf = Vec::new();
+            encoder.read_to_end(&mut buf).await.unwrap();
+            buf
+        });
+        content_encoding = Some("br");
+        filename = "events.csv.br";
+    }
+    let mut builder = Response::builder()
         .status(StatusCode::OK)
         .header(header::CONTENT_TYPE, "text/csv")
-        .header(
-            header::CONTENT_DISPOSITION,
-            "attachment; filename=\"events.csv\"",
-        )
-        .header("Content-Range", content_range)
-        .body(Body::from_stream(stream::iter(chunks)))
-        .unwrap())
+        .header(header::CONTENT_DISPOSITION, format!("attachment; filename=\"{}\"", filename))
+        .header("Content-Range", content_range);
+    if let Some(enc) = content_encoding {
+        builder = builder.header(header::CONTENT_ENCODING, enc);
+    }
+    Ok(builder.body(Body::from(body)).unwrap())
 }
 
 /// Query parameters for the /v1/events/recent endpoint.
@@ -3833,6 +4213,207 @@ pub async fn get_contracts(
     });
 
     Ok(Json(result))
+}
+
+/// In-process TTL cache for per-contract summary data.
+static CONTRACT_SUMMARY_CACHE: OnceLock<Mutex<std::collections::HashMap<String, (ContractDetailSummary, std::time::Instant)>>> = OnceLock::new();
+
+fn contract_summary_cache() -> &'static Mutex<std::collections::HashMap<String, (ContractDetailSummary, std::time::Instant)>> {
+    CONTRACT_SUMMARY_CACHE.get_or_init(|| Mutex::new(std::collections::HashMap::new()))
+}
+
+/// TTL for contract summary cache entries (configurable via env, default 60s).
+fn summary_cache_ttl() -> std::time::Duration {
+    let secs: u64 = std::env::var("CONTRACT_SUMMARY_CACHE_TTL_SECS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(60);
+    std::time::Duration::from_secs(secs)
+}
+
+/// GET /v1/contracts/:contract_id/summary
+///
+/// Returns a per-contract summary: total events, first/last event timestamp,
+/// event type breakdown, unique tx count, and ledger range.
+///
+/// Uses the `mv_contract_summary` materialized view as the primary data source.
+/// Falls back to a direct query if the view is stale or unavailable.
+/// Results are cached in-process with a configurable TTL.
+#[utoipa::path(
+    get,
+    path = "/v1/contracts/{contract_id}/summary",
+    tag = "events",
+    params(
+        ("contract_id" = String, Path, description = "Stellar contract ID (56-char, starts with C)"),
+    ),
+    responses(
+        (status = 200, description = "Contract summary", body = crate::models::ContractDetailSummary),
+        (status = 400, description = "Invalid contract_id format", body = ErrorResponse),
+        (status = 404, description = "Contract not found", body = ErrorResponse),
+        (status = 401, description = "Unauthorized", body = ErrorResponse),
+    )
+)]
+pub async fn get_contract_summary(
+    State(state): State<AppState>,
+    Path(contract_id): Path<String>,
+) -> Result<Json<Value>, AppError> {
+    validate_contract_id(&contract_id)?;
+
+    let ttl = summary_cache_ttl();
+
+    // Check in-process cache
+    {
+        let cache = contract_summary_cache().lock().await;
+        if let Some((summary, inserted_at)) = cache.get(&contract_id) {
+            if inserted_at.elapsed() < ttl {
+                return Ok(Json(serde_json::to_value(summary)?));
+            }
+        }
+    }
+
+    // Try materialized view first
+    let mv_row = sqlx::query(
+        "SELECT total_events, first_event_at, last_event_at, min_ledger, max_ledger, \
+         unique_tx_count, contract_events, diagnostic_events, system_events \
+         FROM mv_contract_summary WHERE contract_id = $1",
+    )
+    .bind(&contract_id)
+    .fetch_optional(&state.read_pool)
+    .await;
+
+    let summary = match mv_row {
+        Ok(Some(row)) => {
+            ContractDetailSummary {
+                contract_id: contract_id.clone(),
+                total_events: row.try_get("total_events")?,
+                first_event_at: row.try_get("first_event_at")?,
+                last_event_at: row.try_get("last_event_at")?,
+                unique_tx_count: row.try_get("unique_tx_count")?,
+                ledger_range: LedgerRange {
+                    min: row.try_get("min_ledger")?,
+                    max: row.try_get("max_ledger")?,
+                },
+                event_type_breakdown: EventTypeBreakdown {
+                    contract: row.try_get("contract_events")?,
+                    diagnostic: row.try_get("diagnostic_events")?,
+                    system: row.try_get("system_events")?,
+                },
+                from_cache: true,
+            }
+        }
+        // Materialized view missing or stale — fall back to direct query
+        _ => {
+            let row = sqlx::query(
+                "SELECT \
+                    COUNT(*)                                                        AS total_events, \
+                    MIN(timestamp)                                                  AS first_event_at, \
+                    MAX(timestamp)                                                  AS last_event_at, \
+                    MIN(ledger)                                                     AS min_ledger, \
+                    MAX(ledger)                                                     AS max_ledger, \
+                    COUNT(DISTINCT tx_hash)                                         AS unique_tx_count, \
+                    COUNT(*) FILTER (WHERE event_type = 'contract')                 AS contract_events, \
+                    COUNT(*) FILTER (WHERE event_type = 'diagnostic')               AS diagnostic_events, \
+                    COUNT(*) FILTER (WHERE event_type = 'system')                   AS system_events \
+                 FROM events WHERE contract_id = $1",
+            )
+            .bind(&contract_id)
+            .fetch_one(&state.read_pool)
+            .await?;
+
+            let total_events: i64 = row.try_get("total_events")?;
+            if total_events == 0 {
+                return Err(AppError::NotFound);
+            }
+
+            ContractDetailSummary {
+                contract_id: contract_id.clone(),
+                total_events,
+                first_event_at: row.try_get("first_event_at")?,
+                last_event_at: row.try_get("last_event_at")?,
+                unique_tx_count: row.try_get("unique_tx_count")?,
+                ledger_range: LedgerRange {
+                    min: row.try_get("min_ledger")?,
+                    max: row.try_get("max_ledger")?,
+                },
+                event_type_breakdown: EventTypeBreakdown {
+                    contract: row.try_get("contract_events")?,
+                    diagnostic: row.try_get("diagnostic_events")?,
+                    system: row.try_get("system_events")?,
+                },
+                from_cache: false,
+            }
+        }
+    };
+
+    // Check for not-found after materialized view path
+    if summary.total_events == 0 {
+        return Err(AppError::NotFound);
+    }
+
+    // Store in cache
+    {
+        let mut cache = contract_summary_cache().lock().await;
+        cache.insert(contract_id, (summary.clone(), std::time::Instant::now()));
+    }
+
+    Ok(Json(serde_json::to_value(&summary)?))
+}
+
+/// GET /v1/contracts/search?q=prefix
+///
+/// Returns contract IDs matching the given prefix (minimum 4 characters).
+/// Uses a `LIKE 'prefix%'` query against the existing `contract_id` index.
+#[utoipa::path(
+    get,
+    path = "/v1/contracts/search",
+    tag = "events",
+    params(
+        ("q" = String, Query, description = "Contract ID prefix to search for (minimum 4 characters)"),
+        ("limit" = Option<i64>, Query, description = "Maximum results to return (1–100, default 20)"),
+    ),
+    responses(
+        (status = 200, description = "Matching contract IDs with event counts", body = Vec<crate::models::ContractSearchResult>),
+        (status = 400, description = "Prefix too short (< 4 chars) or missing", body = ErrorResponse),
+        (status = 401, description = "Unauthorized", body = ErrorResponse),
+    )
+)]
+pub async fn get_contracts_search(
+    State(state): State<AppState>,
+    Query(params): Query<ContractSearchParams>,
+) -> Result<Json<Value>, AppError> {
+    let prefix = params.q.as_deref().unwrap_or("").trim().to_string();
+
+    if prefix.len() < 4 {
+        return Err(AppError::Validation(
+            "q must be at least 4 characters to prevent full-table scans".to_string(),
+        ));
+    }
+
+    // Sanitize: only allow alphanumeric characters in the prefix to prevent injection
+    if !prefix.chars().all(|c| c.is_ascii_alphanumeric()) {
+        return Err(AppError::Validation(
+            "q must contain only alphanumeric characters".to_string(),
+        ));
+    }
+
+    let limit = params.limit.unwrap_or(20).clamp(1, 100);
+    let like_pattern = format!("{}%", prefix);
+
+    let rows = sqlx::query_as::<_, ContractSearchResult>(
+        "SELECT contract_id, COUNT(*) AS event_count, MAX(timestamp) AS last_event_at \
+         FROM events WHERE contract_id LIKE $1 \
+         GROUP BY contract_id ORDER BY event_count DESC LIMIT $2",
+    )
+    .bind(&like_pattern)
+    .bind(limit)
+    .fetch_all(&state.read_pool)
+    .await?;
+
+    Ok(Json(json!({
+        "data": rows,
+        "query": prefix,
+        "limit": limit,
+    })))
 }
 
 /// Query the min and max indexed ledger from the events table.

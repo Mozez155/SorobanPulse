@@ -1,6 +1,7 @@
 use axum::extract::MatchedPath;
 use axum::http::{HeaderValue, Method, Request};
 use axum::{body::Body, routing::get, Router};
+use dashmap::DashMap;
 use metrics_exporter_prometheus::PrometheusHandle;
 use sqlx::PgPool;
 use std::sync::atomic::AtomicUsize;
@@ -23,10 +24,10 @@ use utoipa::OpenApi;
 use uuid::Uuid;
 
 use crate::{
-    config::{Config, HealthState, IndexerState},
+    aggregation, config::{Config, HealthState, IndexerState},
     handlers, metrics, middleware,
     models::SorobanEvent,
-    subscriptions,
+    saved_queries, subscriptions,
 };
 
 type ContractCountCache = moka::future::Cache<String, i64>;
@@ -65,6 +66,8 @@ pub struct AppState {
     pub stats_cache: moka::future::Cache<String, serde_json::Value>,
     /// Shutdown signal for SSE streams (Issue #405)
     pub shutdown_rx: tokio::sync::watch::Receiver<bool>,
+    /// Per-IP SSE connection counts (Issue #453)
+    pub sse_connections_per_ip: Arc<DashMap<String, usize>>,
 }
 
 /// OpenAPI spec — all paths are documented via #[utoipa::path] on handlers.
@@ -112,6 +115,8 @@ pub struct AppState {
         handlers::start_mask_events,
         handlers::get_mask_job_status,
         handlers::get_timeseries,
+        handlers::get_contract_summary,
+        handlers::get_contracts_search,
     ),
     components(schemas(
         crate::models::Event,
@@ -119,6 +124,11 @@ pub struct AppState {
         crate::models::SortOrder,
         crate::models::PaginationParams,
         crate::models::ContractSummary,
+        crate::models::ContractDetailSummary,
+        crate::models::LedgerRange,
+        crate::models::EventTypeBreakdown,
+        crate::models::ContractSearchResult,
+        crate::models::ContractSearchParams,
         crate::models::EventStats,
         crate::models::ContractStatEntry,
         crate::models::ReplayRequest,
@@ -301,6 +311,7 @@ pub fn create_router_with_tx_and_tenant_map(
         tenant_map,
         stats_cache,
         shutdown_rx,
+        sse_connections_per_ip: Arc::new(DashMap::new()),
     };
 
     // Spawn cache invalidation task: subscribe to the broadcast channel and
@@ -375,6 +386,8 @@ pub fn create_router_with_tx_and_tenant_map(
             get(handlers::get_events_by_ledger_hash),
         )
         .route("/contracts", get(handlers::get_contracts))
+        .route("/contracts/search", get(handlers::get_contracts_search))
+        .route("/contracts/{contract_id}/summary", get(handlers::get_contract_summary))
         .route("/admin/replay", axum::routing::post(handlers::replay_events))
         .route("/admin/reencrypt", axum::routing::post(handlers::start_reencrypt))
         .route("/admin/mask-events", axum::routing::post(handlers::start_mask_events))

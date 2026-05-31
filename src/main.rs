@@ -36,6 +36,8 @@ mod schema_validator;
 mod stats_refresh;
 mod subscriptions;
 mod webhook;
+mod notification_formatter;
+mod pagerduty;
 mod xdr_validation;
 
 #[cfg(feature = "archive")]
@@ -214,7 +216,15 @@ async fn main() -> anyhow::Result<()> {
                         let client = http_client.clone();
                         let url = webhook_url.clone();
                         let secret = webhook_secret.clone();
-                        tokio::spawn(webhook::deliver(client, url, secret, event));
+                        let pool_ref = Some(pool.as_ref());
+                        tokio::spawn(webhook::deliver_with_retry_policy(
+                            client, 
+                            url, 
+                            secret, 
+                            event, 
+                            pool_ref,
+                            &config.webhook_retry_policy
+                        ));
                     }
                     Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
                         warn!(
@@ -241,6 +251,8 @@ async fn main() -> anyhow::Result<()> {
                     from.clone(),
                     config.email_to.clone(),
                     config.email_contract_filter.clone(),
+                    config.email_retry_policy.clone(),
+                    pool.clone(),
                 );
 
                 info!(
@@ -257,6 +269,40 @@ async fn main() -> anyhow::Result<()> {
             }
         } else {
             warn!("EMAIL_SMTP_HOST is set but EMAIL_FROM is not — email notifications disabled");
+        }
+    }
+
+    // Spawn SMS notification task if Twilio is configured (Issue #473)
+    if let (Some(account_sid), Some(auth_token), Some(from_number)) = (
+        &config.twilio_account_sid,
+        &config.twilio_auth_token,
+        &config.twilio_from_number,
+    ) {
+        if !config.sms_to_numbers.is_empty() {
+            let sms_rx = event_tx.subscribe();
+            let twilio_config = sms::TwilioConfig {
+                account_sid: account_sid.clone(),
+                auth_token: auth_token.clone(),
+                from_number: from_number.clone(),
+                to_numbers: config.sms_to_numbers.clone(),
+            };
+
+            let notifier = sms::SmsNotifier::new(
+                twilio_config,
+                config.sms_contract_filter.clone(),
+                config.sms_retry_policy.clone(),
+                pool.clone(),
+            );
+
+            info!(
+                from_number = %from_number,
+                recipients = config.sms_to_numbers.len(),
+                "SMS notifications enabled"
+            );
+
+            notifier.spawn(sms_rx);
+        } else {
+            warn!("Twilio credentials set but SMS_TO_NUMBERS is empty — SMS notifications disabled");
         }
     }
 

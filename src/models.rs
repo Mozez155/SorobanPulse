@@ -5,6 +5,44 @@ use std::fmt;
 use std::str::FromStr;
 use uuid::Uuid;
 
+/// Notification format for webhooks
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, sqlx::Type, utoipa::ToSchema)]
+#[sqlx(type_name = "text", rename_all = "lowercase")]
+#[serde(rename_all = "lowercase")]
+pub enum NotificationFormat {
+    Raw,
+    Slack,
+    Discord,
+    Teams,
+    Pagerduty,
+}
+
+impl fmt::Display for NotificationFormat {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            NotificationFormat::Raw => write!(f, "raw"),
+            NotificationFormat::Slack => write!(f, "slack"),
+            NotificationFormat::Discord => write!(f, "discord"),
+            NotificationFormat::Teams => write!(f, "teams"),
+            NotificationFormat::Pagerduty => write!(f, "pagerduty"),
+        }
+    }
+}
+
+impl FromStr for NotificationFormat {
+    type Err = String;
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "raw" => Ok(NotificationFormat::Raw),
+            "slack" => Ok(NotificationFormat::Slack),
+            "discord" => Ok(NotificationFormat::Discord),
+            "teams" => Ok(NotificationFormat::Teams),
+            "pagerduty" => Ok(NotificationFormat::Pagerduty),
+            other => Err(format!("unknown notification format: {other}")),
+        }
+    }
+}
+
 #[derive(
     Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, sqlx::Type, utoipa::ToSchema,
 )]
@@ -108,6 +146,8 @@ pub struct PaginationParams {
     pub to_timestamp: Option<String>,
     /// Return event_data as base64-encoded gzip-compressed JSON (default: false).
     pub compact: Option<bool>,
+    /// Filter events by contract ID prefix (minimum 4 characters, uses LIKE 'prefix%').
+    pub contract_id_prefix: Option<String>,
 }
 
 /// Sort order for event list endpoints.
@@ -182,6 +222,8 @@ impl SearchParams {
 pub struct StreamParams {
     pub contract_id: Option<String>,
     pub fields: Option<String>,
+    /// Filter by event type: contract, diagnostic, system
+    pub event_type: Option<EventType>,
 }
 
 /// Query parameters for the multi-contract SSE stream endpoint.
@@ -189,6 +231,8 @@ pub struct StreamParams {
 pub struct MultiStreamParams {
     /// Comma-separated list of contract IDs to subscribe to.
     pub contract_ids: Option<String>,
+    /// Filter by event type: contract, diagnostic, system
+    pub event_type: Option<EventType>,
 }
 
 /// Standard error response body returned by all error responses.
@@ -211,6 +255,10 @@ pub struct ExportParams {
     /// Optional JSON object mapping source field names to target field names.
     /// Example: `{"event_data":"raw_data","ledger":"ledger_seq"}`
     pub field_map: Option<String>,
+    /// Optional ISO 8601 timestamp filter (start)
+    pub from_timestamp: Option<chrono::DateTime<chrono::Utc>>,
+    /// Optional ISO 8601 timestamp filter (end)
+    pub to_timestamp: Option<chrono::DateTime<chrono::Utc>>,
 }
 
 /// Request body for POST /v1/admin/mask-events
@@ -277,6 +325,49 @@ pub struct TimeseriesResponse {
     pub bucket: String,
     /// Array of time buckets
     pub data: Vec<TimeseriesBucket>,
+}
+
+/// Webhook configuration for formatted notifications
+#[derive(Debug, Serialize, Deserialize, sqlx::FromRow, utoipa::ToSchema)]
+pub struct WebhookConfig {
+    pub id: Uuid,
+    pub url: String,
+    pub secret: Option<String>,
+    pub notification_format: NotificationFormat,
+    pub message_template: Option<String>,
+    pub contract_filter: Option<Vec<String>>,
+    pub event_type_filter: Option<Vec<String>>,
+    pub active: bool,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+}
+
+/// PagerDuty configuration for incident management
+#[derive(Debug, Serialize, Deserialize, sqlx::FromRow, utoipa::ToSchema)]
+pub struct PagerDutyConfig {
+    pub id: Uuid,
+    pub routing_key: String,
+    pub service_name: String,
+    pub contract_filter: Option<Vec<String>>,
+    pub event_type_filter: Option<Vec<String>>,
+    pub severity_mapping: Value,
+    pub auto_resolve: bool,
+    pub active: bool,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+}
+
+/// PagerDuty incident tracking
+#[derive(Debug, Serialize, Deserialize, sqlx::FromRow, utoipa::ToSchema)]
+pub struct PagerDutyIncident {
+    pub id: Uuid,
+    pub dedup_key: String,
+    pub contract_id: String,
+    pub event_type: String,
+    pub incident_key: Option<String>,
+    pub status: String,
+    pub created_at: DateTime<Utc>,
+    pub resolved_at: Option<DateTime<Utc>>,
 }
 
 /// Query parameters for GET /v1/events/diff
@@ -357,6 +448,49 @@ pub struct ContractSummary {
     pub first_seen_ledger: i64,
     pub last_seen_ledger: i64,
     pub last_event_at: DateTime<Utc>,
+}
+
+/// Detailed per-contract summary returned by GET /v1/contracts/:contract_id/summary.
+#[derive(Debug, Serialize, Clone, utoipa::ToSchema)]
+pub struct ContractDetailSummary {
+    pub contract_id: String,
+    pub total_events: i64,
+    pub first_event_at: Option<DateTime<Utc>>,
+    pub last_event_at: Option<DateTime<Utc>>,
+    pub unique_tx_count: i64,
+    pub ledger_range: LedgerRange,
+    pub event_type_breakdown: EventTypeBreakdown,
+    /// Whether the data was served from the materialized view (true) or a live query (false).
+    pub from_cache: bool,
+}
+
+#[derive(Debug, Serialize, Clone, utoipa::ToSchema)]
+pub struct LedgerRange {
+    pub min: Option<i64>,
+    pub max: Option<i64>,
+}
+
+#[derive(Debug, Serialize, Clone, utoipa::ToSchema)]
+pub struct EventTypeBreakdown {
+    pub contract: i64,
+    pub diagnostic: i64,
+    pub system: i64,
+}
+
+/// A single result from the contract ID prefix search endpoint.
+#[derive(Debug, Serialize, sqlx::FromRow, utoipa::ToSchema)]
+pub struct ContractSearchResult {
+    pub contract_id: String,
+    pub event_count: i64,
+    pub last_event_at: Option<DateTime<Utc>>,
+}
+
+/// Query parameters for GET /v1/contracts/search
+#[derive(Debug, Deserialize, utoipa::ToSchema)]
+pub struct ContractSearchParams {
+    /// Prefix to search for (minimum 4 characters).
+    pub q: Option<String>,
+    pub limit: Option<i64>,
 }
 
 /// Aggregate statistics for indexed events.
@@ -442,6 +576,59 @@ impl PaginationParams {
 
     pub fn limit(&self) -> i64 {
         self.limit.unwrap_or(20).clamp(1, 100)
+    }
+
+    /// Validate geospatial parameters
+    pub fn validate_geospatial(&self) -> Result<(), String> {
+        let has_lat = self.near_lat.is_some();
+        let has_lon = self.near_lon.is_some();
+        let has_radius = self.radius_km.is_some();
+
+        // All three must be provided together or none at all
+        if has_lat || has_lon || has_radius {
+            if !has_lat || !has_lon || !has_radius {
+                return Err("near_lat, near_lon, and radius_km must all be provided together".to_string());
+            }
+
+            let lat = self.near_lat.unwrap();
+            let lon = self.near_lon.unwrap();
+            let radius = self.radius_km.unwrap();
+
+            // Validate latitude range
+            if lat < -90.0 || lat > 90.0 {
+                return Err("near_lat must be between -90 and 90".to_string());
+            }
+
+            // Validate longitude range
+            if lon < -180.0 || lon > 180.0 {
+                return Err("near_lon must be between -180 and 180".to_string());
+            }
+
+            // Validate radius
+            if radius <= 0.0 || radius > 20000.0 {
+                return Err("radius_km must be between 0 and 20000".to_string());
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Validate exclusion parameters
+    pub fn validate_exclusions(&self) -> Result<(), String> {
+        // Cannot specify both include and exclude for the same parameter
+        if self.contract_id.is_some() && self.exclude_contract_ids.is_some() {
+            return Err("cannot specify both contract_id and exclude_contract_ids".to_string());
+        }
+
+        if self.contract_ids.is_some() && self.exclude_contract_ids.is_some() {
+            return Err("cannot specify both contract_ids and exclude_contract_ids".to_string());
+        }
+
+        if self.event_type.is_some() && self.exclude_event_types.is_some() {
+            return Err("cannot specify both event_type and exclude_event_types".to_string());
+        }
+
+        Ok(())
     }
 }
 
@@ -637,5 +824,26 @@ mod tests {
         assert!(result.events.is_empty());
         assert_eq!(result.latest_ledger, 1234600);
         assert!(result.rpc_cursor.is_none());
+    }
+}
+#[derive(Debug, Serialize)]
+pub struct PaginatedResponse<T> {
+    pub data: Vec<T>,
+    pub page: i64,
+    pub limit: i64,
+    pub total: i64,
+    pub has_more: bool,
+}
+
+impl<T> PaginatedResponse<T> {
+    pub fn new(data: Vec<T>, page: i64, limit: i64, total: i64) -> Self {
+        let has_more = (page * limit) < total;
+        Self {
+            data,
+            page,
+            limit,
+            total,
+            has_more,
+        }
     }
 }

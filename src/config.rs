@@ -250,6 +250,28 @@ pub struct Config {
     pub email_from: Option<String>,
     pub email_to: Vec<String>,
     pub email_contract_filter: Vec<String>,
+    // SMS notification fields (Issue #473)
+    pub twilio_account_sid: Option<String>,
+    pub twilio_auth_token: Option<SecretString>,
+    pub twilio_from_number: Option<String>,
+    pub sms_to_numbers: Vec<String>,
+    pub sms_contract_filter: Vec<String>,
+    // Notification retry policies (Issue #474)
+    pub webhook_retry_policy: crate::retry_policy::RetryPolicy,
+    pub email_retry_policy: crate::retry_policy::RetryPolicy,
+    pub sms_retry_policy: crate::retry_policy::RetryPolicy,
+    // SMS notification fields (Issue #473)
+    pub twilio_account_sid: Option<String>,
+    pub twilio_auth_token: Option<SecretString>,
+    pub twilio_from_number: Option<String>,
+    pub sms_to_numbers: Vec<String>,
+    pub sms_contract_filter: Vec<String>,
+    // Notification retry policies (Issue #474)
+    pub webhook_retry_policy: crate::retry_policy::RetryPolicy,
+    pub email_retry_policy: crate::retry_policy::RetryPolicy,
+    pub sms_retry_policy: crate::retry_policy::RetryPolicy,
+    pub email_to: Vec<String>,
+    pub email_contract_filter: Vec<String>,
     // Redis stream fields
     pub redis_url: Option<String>,
     pub redis_stream_key: Option<String>,
@@ -262,6 +284,11 @@ pub struct Config {
     pub pruning_interval_hours: u64,
     // Issue #325: SSE Last-Event-ID replay limit
     pub sse_replay_limit: u64,
+    // Issue #454: SSE_REPLAY_MAX_EVENTS (alias for sse_replay_limit, read from SSE_REPLAY_MAX_EVENTS env var)
+    // Issue #453: Per-IP SSE connection limit
+    pub sse_max_connections_per_ip: usize,
+    // Issue #451: Max lag before disconnect
+    pub sse_max_lag_before_disconnect: u64,
     // Issue #396: Indexer checkpoint persistence
     pub indexer_ignore_checkpoint: bool,
     // Issue #426: Maximum events per RPC page
@@ -274,6 +301,22 @@ pub struct Config {
     pub event_transform_script: Option<String>,
     /// Execution timeout for Lua scripts in milliseconds (default: 100).
     pub event_transform_timeout_ms: u64,
+    
+    // Webhook notification formatting
+    pub webhook_notification_format: String,
+    pub webhook_message_template: Option<String>,
+    
+    // PagerDuty configuration (Issue #472)
+    pub pagerduty_routing_key: Option<String>,
+    pub pagerduty_service_name: String,
+    pub pagerduty_contract_filter: Vec<String>,
+    pub pagerduty_event_type_filter: Vec<String>,
+    pub pagerduty_severity_mapping: std::collections::HashMap<String, String>,
+    pub pagerduty_auto_resolve: bool,
+    pub pagerduty_auto_resolve_threshold_minutes: i64,
+    
+    // Stats cache TTL
+    pub stats_cache_ttl_secs: u64,
 }
 
 impl Default for Config {
@@ -348,7 +391,9 @@ impl Default for Config {
             stats_refresh_interval_secs: 3600,
             retention_days: 90,
             pruning_interval_hours: 24,
-            sse_replay_limit: 500,
+            sse_replay_limit: 1000,
+            sse_max_connections_per_ip: 10,
+            sse_max_lag_before_disconnect: 0, // 0 = disabled
             indexer_ignore_checkpoint: false,
             webhook_require_https: false,
             rpc_max_events_per_page: 200,
@@ -356,6 +401,22 @@ impl Default for Config {
             slow_query_threshold_ms: 1000,
             event_transform_script: None,
             event_transform_timeout_ms: 100,
+            webhook_notification_format: "raw".to_string(),
+            webhook_message_template: None,
+            pagerduty_routing_key: None,
+            pagerduty_service_name: "Soroban Pulse".to_string(),
+            pagerduty_contract_filter: Vec::new(),
+            pagerduty_event_type_filter: Vec::new(),
+            pagerduty_severity_mapping: {
+                let mut map = std::collections::HashMap::new();
+                map.insert("contract".to_string(), "error".to_string());
+                map.insert("diagnostic".to_string(), "warning".to_string());
+                map.insert("system".to_string(), "info".to_string());
+                map
+            },
+            pagerduty_auto_resolve: true,
+            pagerduty_auto_resolve_threshold_minutes: 30,
+            stats_cache_ttl_secs: 30,
         }
     }
 }
@@ -1122,9 +1183,16 @@ impl Config {
             pruning_interval_hours: env_or_file("PRUNING_INTERVAL_HOURS", &file)
                 .and_then(|v| v.parse().ok())
                 .unwrap_or(24),
-            sse_replay_limit: env_or_file("SSE_REPLAY_LIMIT", &file)
+            sse_replay_limit: env_or_file("SSE_REPLAY_MAX_EVENTS", &file)
+                .or_else(|| env_or_file("SSE_REPLAY_LIMIT", &file))
                 .and_then(|v| v.parse().ok())
-                .unwrap_or(500),
+                .unwrap_or(1000),
+            sse_max_connections_per_ip: env_or_file("SSE_MAX_CONNECTIONS_PER_IP", &file)
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(10),
+            sse_max_lag_before_disconnect: env_or_file("SSE_MAX_LAG_BEFORE_DISCONNECT", &file)
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(0),
             max_ledger_range: parse_int::<u64>(
                 "MAX_LEDGER_RANGE",
                 &env_or_file_or("MAX_LEDGER_RANGE", &file, "100000"),
@@ -1157,6 +1225,46 @@ impl Config {
                 &mut errors,
             )
             .unwrap_or(100),
+            webhook_notification_format: env_or_file("WEBHOOK_NOTIFICATION_FORMAT", &file)
+                .unwrap_or_else(|| "raw".to_string()),
+            webhook_message_template: env_or_file("WEBHOOK_MESSAGE_TEMPLATE", &file),
+            pagerduty_routing_key: env_or_file("PAGERDUTY_ROUTING_KEY", &file),
+            pagerduty_service_name: env_or_file("PAGERDUTY_SERVICE_NAME", &file)
+                .unwrap_or_else(|| "Soroban Pulse".to_string()),
+            pagerduty_contract_filter: env_or_file("PAGERDUTY_CONTRACT_FILTER", &file)
+                .map(|v| {
+                    v.split(',')
+                        .map(|s| s.trim().to_string())
+                        .filter(|s| !s.is_empty())
+                        .collect()
+                })
+                .unwrap_or_default(),
+            pagerduty_event_type_filter: env_or_file("PAGERDUTY_EVENT_TYPE_FILTER", &file)
+                .map(|v| {
+                    v.split(',')
+                        .map(|s| s.trim().to_string())
+                        .filter(|s| !s.is_empty())
+                        .collect()
+                })
+                .unwrap_or_default(),
+            pagerduty_severity_mapping: env_or_file("PAGERDUTY_SEVERITY_MAPPING", &file)
+                .and_then(|v| serde_json::from_str(&v).ok())
+                .unwrap_or_else(|| {
+                    let mut map = std::collections::HashMap::new();
+                    map.insert("contract".to_string(), "error".to_string());
+                    map.insert("diagnostic".to_string(), "warning".to_string());
+                    map.insert("system".to_string(), "info".to_string());
+                    map
+                }),
+            pagerduty_auto_resolve: env_or_file("PAGERDUTY_AUTO_RESOLVE", &file)
+                .map(|v| matches!(v.to_ascii_lowercase().as_str(), "true" | "1" | "yes" | "y"))
+                .unwrap_or(true),
+            pagerduty_auto_resolve_threshold_minutes: env_or_file("PAGERDUTY_AUTO_RESOLVE_THRESHOLD_MINUTES", &file)
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(30),
+            stats_cache_ttl_secs: env_or_file("STATS_CACHE_TTL_SECS", &file)
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(30),
         }
     }
 }

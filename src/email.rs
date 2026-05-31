@@ -2,13 +2,14 @@ use lettre::message::{header, MultiPart, SinglePart};
 use lettre::transport::smtp::authentication::Credentials;
 use lettre::{Message, SmtpTransport, Transport};
 use secrecy::{ExposeSecret, SecretString};
+use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use std::time::Duration;
 use tokio::sync::mpsc;
 use tokio::time::{interval, sleep};
 use tracing::{error, info, warn};
 
-use crate::{metrics, models::SorobanEvent};
+use crate::{metrics, models::SorobanEvent, retry_policy::RetryPolicy};
 
 /// Batched email notification sender.
 /// Collects events for up to 1 minute, then sends a single summary email.
@@ -20,6 +21,8 @@ pub struct EmailNotifier {
     from: String,
     to: Vec<String>,
     contract_filter: Vec<String>,
+    retry_policy: RetryPolicy,
+    pool: sqlx::PgPool,
 }
 
 impl EmailNotifier {
@@ -31,6 +34,8 @@ impl EmailNotifier {
         from: String,
         to: Vec<String>,
         contract_filter: Vec<String>,
+        retry_policy: RetryPolicy,
+        pool: sqlx::PgPool,
     ) -> Self {
         Self {
             smtp_host,
@@ -40,6 +45,8 @@ impl EmailNotifier {
             from,
             to,
             contract_filter,
+            retry_policy,
+            pool,
         }
     }
 
@@ -93,10 +100,33 @@ impl EmailNotifier {
         })
     }
 
-    /// Send a summary email for a batch of events.
+    /// Send a summary email for a batch of events with idempotency (Issue #474).
     async fn send_batch_email(&self, events: &[SorobanEvent]) {
         if events.is_empty() {
             return;
+        }
+
+        // Generate idempotency key based on event batch
+        let event_ids: Vec<String> = events.iter().map(|e| e.id.to_string()).collect();
+        let idempotency_key = format!("batch_{}", 
+            sha2::Sha256::digest(event_ids.join(",").as_bytes())
+                .iter()
+                .map(|b| format!("{:02x}", b))
+                .collect::<String>()[..16].to_string()
+        );
+
+        // Check if already sent
+        if let Ok(existing) = sqlx::query_scalar::<_, i64>(
+            "SELECT COUNT(*) FROM email_notifications WHERE idempotency_key = $1"
+        )
+        .bind(&idempotency_key)
+        .fetch_one(&self.pool)
+        .await
+        {
+            if existing > 0 {
+                info!(idempotency_key = %idempotency_key, "Email already sent, skipping");
+                return;
+            }
         }
 
         // Group events by contract ID for better readability

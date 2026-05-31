@@ -19,14 +19,33 @@ pub fn sign_payload(secret: &str, body: &[u8]) -> String {
     hex::encode(result.into_bytes())
 }
 
-/// Deliver a single event to the webhook URL with up to 3 retries and
-/// exponential backoff (1s, 2s, 4s). On final failure, insert into DLQ.
+/// Deliver a single event to the webhook URL with configurable retry policy.
+/// On final failure, insert into DLQ.
 pub async fn deliver(
     client: Client,
     url: String,
     secret: Option<String>,
     event: SorobanEvent,
     pool: Option<&sqlx::PgPool>,
+) {
+    deliver_with_retry_policy(
+        client,
+        url,
+        secret,
+        event,
+        pool,
+        &crate::retry_policy::RetryPolicy::webhook_default(),
+    ).await
+}
+
+/// Deliver with custom retry policy (Issue #474)
+pub async fn deliver_with_retry_policy(
+    client: Client,
+    url: String,
+    secret: Option<String>,
+    event: SorobanEvent,
+    pool: Option<&sqlx::PgPool>,
+    retry_policy: &crate::retry_policy::RetryPolicy,
 ) {
     let body = match serde_json::to_vec(&event) {
         Ok(b) => b,
@@ -38,71 +57,75 @@ pub async fn deliver(
 
     let signature = secret.as_deref().map(|s| sign_payload(s, &body));
 
-    let mut backoff_ms = 1000u64;
-    for attempt in 1..=3u32 {
-        let mut req = client
-            .post(&url)
-            .header("Content-Type", "application/json")
-            .body(body.clone());
-
-        if let Some(ref sig) = signature {
-            req = req.header("X-Signature-256", format!("sha256={sig}"));
-        }
-
-        match req.send().await {
-            Ok(resp) if resp.status().is_success() => {
-                info!(
-                    url = %url,
-                    contract_id = %event.contract_id,
-                    attempt = attempt,
-                    "Webhook delivered successfully"
-                );
-                return;
-            }
-            Ok(resp) => {
-                warn!(
-                    url = %url,
-                    status = %resp.status(),
-                    attempt = attempt,
-                    "Webhook delivery failed with non-2xx status"
-                );
-            }
-            Err(e) => {
-                warn!(
-                    url = %url,
-                    error = %e,
-                    attempt = attempt,
-                    "Webhook delivery request error"
-                );
-            }
-        }
-
-        if attempt < 3 {
-            sleep(Duration::from_millis(backoff_ms)).await;
-            backoff_ms *= 2;
-        }
-    }
-
-    error!(url = %url, contract_id = %event.contract_id, "Webhook delivery failed after 3 attempts");
-    
-    // Insert into DLQ if pool is available
-    if let Some(pool) = pool {
-        let payload = serde_json::to_value(&event).unwrap_or(serde_json::json!({}));
-        let next_retry = chrono::Utc::now() + chrono::Duration::seconds(60);
+    let result = retry_policy.execute_with_retry(|attempt| {
+        let client = client.clone();
+        let url = url.clone();
+        let body = body.clone();
+        let signature = signature.clone();
         
-        if let Err(e) = sqlx::query(
-            "INSERT INTO webhook_failures (url, payload, attempts, last_error, next_retry_at) 
-             VALUES ($1, $2, $3, $4, $5)"
-        )
-        .bind(&url)
-        .bind(payload)
-        .bind(3i32)
-        .bind("Failed after 3 retries")
-        .bind(next_retry)
-        .execute(pool)
-        .await
-        {
-            error!(error = %e, "Failed to insert webhook failure into DLQ");
+        async move {
+            let mut req = client
+                .post(&url)
+                .header("Content-Type", "application/json")
+                .body(body);
+
+            if let Some(ref sig) = signature {
+                req = req.header("X-Signature-256", format!("sha256={sig}"));
+            }
+
+            match req.send().await {
+                Ok(resp) if resp.status().is_success() => {
+                    info!(
+                        url = %url,
+                        contract_id = %event.contract_id,
+                        attempt = attempt,
+                        "Webhook delivered successfully"
+                    );
+                    Ok(())
+                }
+                Ok(resp) => {
+                    let error_msg = format!("HTTP {}: {}", resp.status(), 
+                        resp.text().await.unwrap_or_default());
+                    Err(error_msg)
+                }
+                Err(e) => {
+                    Err(format!("Request error: {}", e))
+                }
+            }
+        }
+    }).await;
+
+    match result {
+        Ok(()) => return, // Success
+        Err(error_msg) => {
+            error!(
+                url = %url,
+                contract_id = %event.contract_id,
+                error = %error_msg,
+                max_attempts = retry_policy.max_attempts,
+                "Webhook delivery failed after all retries"
+            );
+    
+            // Insert into DLQ if pool is available
+            if let Some(pool) = pool {
+                let payload = serde_json::to_value(&event).unwrap_or(serde_json::json!({}));
+                let next_retry = chrono::Utc::now() + chrono::Duration::seconds(60);
+                
+                if let Err(e) = sqlx::query(
+                    "INSERT INTO webhook_failures (url, payload, attempts, last_error, next_retry_at) 
+                     VALUES ($1, $2, $3, $4, $5)"
+                )
+                .bind(&url)
+                .bind(payload)
+                .bind(retry_policy.max_attempts as i32)
+                .bind(&error_msg)
+                .bind(next_retry)
+                .execute(pool)
+                .await
+                {
+                    error!(error = %e, "Failed to insert webhook failure into DLQ");
+                }
+            }
         }
     }
     
