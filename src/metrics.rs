@@ -187,6 +187,21 @@ pub fn record_email_failure() {
     m::counter!("soroban_pulse_email_failures_total").increment(1);
 }
 
+/// Record an email open event (Issue #487)
+pub fn record_email_open() {
+    m::counter!("soroban_pulse_email_opens_total").increment(1);
+}
+
+/// Record an email link click event (Issue #488)
+pub fn record_email_click() {
+    m::counter!("soroban_pulse_email_clicks_total").increment(1);
+}
+
+/// Record a notification that was suppressed (Issue #490)
+pub fn record_notification_suppressed() {
+    m::counter!("soroban_pulse_notifications_suppressed_total").increment(1);
+}
+
 /// Record a full-text search query duration
 pub fn record_search_query_duration(duration: std::time::Duration) {
     m::histogram!("soroban_pulse_search_query_duration_seconds").record(duration.as_secs_f64());
