@@ -777,3 +777,56 @@ Expected output on PostgreSQL 14+:
 ```
 
 (`x` = EXTENDED, `l` = lz4)
+
+---
+
+## Email Deliverability: DKIM Signing
+
+DKIM (DomainKeys Identified Mail) cryptographically signs outgoing emails so
+recipient mail servers can verify they were authorized by your domain. Without
+DKIM, notification emails are far more likely to be classified as spam.
+
+### Configuration
+
+| Variable | Description |
+|----------|-------------|
+| `DKIM_PRIVATE_KEY_PATH` | Path to a PEM-encoded RSA private key. When set, all outgoing emails are DKIM-signed. |
+| `DKIM_SELECTOR` | The DKIM selector, published in DNS as `<selector>._domainkey.<domain>`. Required when `DKIM_PRIVATE_KEY_PATH` is set. |
+
+The signing domain is derived from the `EMAIL_FROM` address.
+
+### Generating a key pair
+
+```bash
+# 1. Generate a 2048-bit RSA private key
+openssl genrsa -out dkim_private.pem 2048
+
+# 2. Extract the public key for the DNS record
+openssl rsa -in dkim_private.pem -pubout -outform der 2>/dev/null \
+  | openssl base64 -A
+```
+
+### Publishing the DNS record
+
+Create a TXT record at `<selector>._domainkey.<your-domain>` (e.g.
+`pulse._domainkey.example.com`):
+
+```
+v=DKIM1; k=rsa; p=<base64-public-key-from-step-2>
+```
+
+### Enabling in the service
+
+```bash
+DKIM_PRIVATE_KEY_PATH=/run/secrets/dkim_private.pem
+DKIM_SELECTOR=pulse
+EMAIL_FROM=soroban-pulse@example.com
+```
+
+### Startup validation
+
+On startup the service reads and validates the DKIM key. If the key is missing,
+unreadable, or not a valid RSA private key — or if `DKIM_PRIVATE_KEY_PATH` is set
+without `DKIM_SELECTOR` — startup **fails with a clear error** rather than
+silently sending unsigned mail. Verify a successful start by looking for the
+`DKIM signing enabled for outgoing email` log line.

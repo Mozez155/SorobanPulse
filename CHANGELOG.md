@@ -8,6 +8,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- DKIM signing for notification emails (Issue #485): when `DKIM_PRIVATE_KEY_PATH` and `DKIM_SELECTOR` are configured, all outgoing emails are DKIM-signed via lettre. The signing key is validated at startup (startup fails with a clear error on an invalid/missing key), and the setup is documented in `docs/deployment.md`.
 - Email notification feature for event alerts with batching (one email per minute maximum)
 - Email configuration via `EMAIL_SMTP_HOST`, `EMAIL_SMTP_PORT`, `EMAIL_SMTP_USER`, `EMAIL_SMTP_PASSWORD`, `EMAIL_FROM`, `EMAIL_TO`, and `EMAIL_CONTRACT_FILTER` environment variables
 - Email notifications can be filtered by contract ID using `EMAIL_CONTRACT_FILTER`

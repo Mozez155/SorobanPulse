@@ -1,3 +1,4 @@
+use lettre::message::dkim::{DkimConfig, DkimSigningAlgorithm, DkimSigningKey};
 use lettre::message::{header, MultiPart, SinglePart};
 use lettre::transport::smtp::authentication::Credentials;
 use lettre::{Message, SmtpTransport, Transport};
@@ -11,6 +12,34 @@ use tracing::{error, info, warn};
 
 use crate::{metrics, models::SorobanEvent, retry_policy::RetryPolicy};
 
+/// Extract the domain portion of a `From` address for DKIM `d=` tagging.
+/// Handles both bare `user@example.com` and `Name <user@example.com>` forms.
+fn dkim_domain_from(from: &str) -> Option<String> {
+    let domain = from.rsplit('@').next()?.trim_end_matches('>').trim();
+    if domain.is_empty() {
+        None
+    } else {
+        Some(domain.to_string())
+    }
+}
+
+/// Validate that `pem` is a usable RSA DKIM signing key (Issue #485). Used at
+/// startup to fail fast with a clear error when the key is missing or invalid.
+pub fn validate_dkim_key(pem: &str) -> Result<(), String> {
+    DkimSigningKey::new(pem, DkimSigningAlgorithm::Rsa)
+        .map(|_| ())
+        .map_err(|e| format!("invalid DKIM private key: {e}"))
+}
+
+/// Build a `DkimConfig` from a selector, sender address and PEM-encoded key.
+fn build_dkim_config(selector: &str, from: &str, key_pem: &str) -> Result<DkimConfig, String> {
+    let domain = dkim_domain_from(from)
+        .ok_or_else(|| "EMAIL_FROM has no domain for DKIM signing".to_string())?;
+    let key = DkimSigningKey::new(key_pem, DkimSigningAlgorithm::Rsa)
+        .map_err(|e| format!("invalid DKIM private key: {e}"))?;
+    Ok(DkimConfig::default_config(selector.to_string(), domain, key))
+}
+
 /// Batched email notification sender.
 /// Collects events for up to 1 minute, then sends a single summary email.
 pub struct EmailNotifier {
@@ -23,9 +52,15 @@ pub struct EmailNotifier {
     contract_filter: Vec<String>,
     retry_policy: RetryPolicy,
     pool: sqlx::PgPool,
+    /// DKIM selector; when set together with `dkim_private_key`, outgoing
+    /// emails are DKIM-signed (Issue #485).
+    dkim_selector: Option<String>,
+    /// PEM-encoded RSA private key used for DKIM signing (Issue #485).
+    dkim_private_key: Option<SecretString>,
 }
 
 impl EmailNotifier {
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         smtp_host: String,
         smtp_port: u16,
@@ -36,6 +71,8 @@ impl EmailNotifier {
         contract_filter: Vec<String>,
         retry_policy: RetryPolicy,
         pool: sqlx::PgPool,
+        dkim_selector: Option<String>,
+        dkim_private_key: Option<SecretString>,
     ) -> Self {
         Self {
             smtp_host,
@@ -47,6 +84,8 @@ impl EmailNotifier {
             contract_filter,
             retry_policy,
             pool,
+            dkim_selector,
+            dkim_private_key,
         }
     }
 
@@ -205,9 +244,19 @@ impl EmailNotifier {
             message_builder = message_builder.to(recipient.parse()?);
         }
 
-        let message = message_builder
+        let mut message = message_builder
             .header(header::ContentType::TEXT_PLAIN)
             .body(body.to_string())?;
+
+        // DKIM-sign the message when a signing key is configured (Issue #485).
+        // A bad key never blocks delivery — it is logged and the email is sent
+        // unsigned (the key is validated at startup, so this is defensive).
+        if let (Some(selector), Some(key)) = (&self.dkim_selector, &self.dkim_private_key) {
+            match build_dkim_config(selector, &self.from, key.expose_secret()) {
+                Ok(config) => message.sign(&config),
+                Err(e) => warn!(error = %e, "DKIM signing skipped"),
+            }
+        }
 
         // Build SMTP transport
         let mut transport_builder = SmtpTransport::relay(&self.smtp_host)?.port(self.smtp_port);
@@ -252,6 +301,7 @@ mod tests {
 
     #[test]
     fn test_email_notifier_creation() {
+        let pool = sqlx::PgPool::connect_lazy("postgres://localhost/unused").unwrap();
         let notifier = EmailNotifier::new(
             "smtp.example.com".to_string(),
             587,
@@ -260,12 +310,43 @@ mod tests {
             "from@example.com".to_string(),
             vec!["to@example.com".to_string()],
             vec![],
+            RetryPolicy::default(),
+            pool,
+            None,
+            None,
         );
 
         assert_eq!(notifier.smtp_host, "smtp.example.com");
         assert_eq!(notifier.smtp_port, 587);
         assert_eq!(notifier.from, "from@example.com");
         assert_eq!(notifier.to.len(), 1);
+    }
+
+    #[test]
+    fn test_dkim_domain_extraction() {
+        assert_eq!(
+            dkim_domain_from("pulse@example.com").as_deref(),
+            Some("example.com")
+        );
+        assert_eq!(
+            dkim_domain_from("Soroban Pulse <pulse@mail.example.com>").as_deref(),
+            Some("mail.example.com")
+        );
+        assert_eq!(dkim_domain_from("not-an-email").as_deref(), Some("not-an-email"));
+        assert_eq!(dkim_domain_from("trailing@").as_deref(), None);
+    }
+
+    #[test]
+    fn test_validate_dkim_key_rejects_garbage() {
+        assert!(validate_dkim_key("not a pem key").is_err());
+        assert!(validate_dkim_key("").is_err());
+    }
+
+    #[test]
+    fn test_build_dkim_config_requires_domain() {
+        // An invalid key still surfaces an error rather than panicking.
+        let err = build_dkim_config("selector", "bad@", "not a key");
+        assert!(err.is_err());
     }
 
     #[test]
