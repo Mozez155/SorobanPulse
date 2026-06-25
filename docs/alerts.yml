@@ -150,3 +150,13 @@ groups:
           summary: "Materialized view refresh hit lock timeout"
           description: "A materialized view refresh was skipped due to a lock timeout in the last hour. Check for long-running queries blocking the view lock."
           runbook_url: "https://github.com/Soroban-Pulse/SorobanPulse/blob/main/docs/runbooks/db-pool-exhaustion.md"
+
+      - alert: NotificationChannelUnhealthy
+        expr: soroban_pulse_notification_channel_healthy == 0
+        for: 5m
+        labels:
+          severity: critical
+          component: notifications
+        annotations:
+          summary: "Notification channel {{ $labels.channel }} ({{ $labels.type }}) is unhealthy"
+          description: "Health check for notification channel '{{ $labels.channel }}' of type '{{ $labels.type }}' has been failing for 5 minutes. Notifications through this channel may not be delivered."

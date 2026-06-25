@@ -317,6 +317,16 @@ pub struct Config {
     
     // Stats cache TTL
     pub stats_cache_ttl_secs: u64,
+
+    // #496 Notification audit log retention
+    /// Retention period for notification audit log entries (days, default 90).
+    pub notification_audit_log_retention_days: i64,
+
+    // #498 Channel health checks
+    /// How often to health-check notification channels (seconds, default 300).
+    pub notification_health_check_interval_secs: u64,
+    /// Email address to send health-check test emails to.
+    pub notification_health_check_email: Option<String>,
 }
 
 impl Default for Config {
@@ -417,6 +427,9 @@ impl Default for Config {
             pagerduty_auto_resolve: true,
             pagerduty_auto_resolve_threshold_minutes: 30,
             stats_cache_ttl_secs: 30,
+            notification_audit_log_retention_days: 90,
+            notification_health_check_interval_secs: 300,
+            notification_health_check_email: None,
         }
     }
 }
@@ -1265,6 +1278,13 @@ impl Config {
             stats_cache_ttl_secs: env_or_file("STATS_CACHE_TTL_SECS", &file)
                 .and_then(|v| v.parse().ok())
                 .unwrap_or(30),
+            notification_audit_log_retention_days: env_or_file("NOTIFICATION_AUDIT_LOG_RETENTION_DAYS", &file)
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(90),
+            notification_health_check_interval_secs: env_or_file("NOTIFICATION_HEALTH_CHECK_INTERVAL_SECS", &file)
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(300),
+            notification_health_check_email: env_or_file("NOTIFICATION_HEALTH_CHECK_EMAIL", &file),
         }
     }
 }

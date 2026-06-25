@@ -401,7 +401,16 @@ pub fn create_router_with_tx_and_tenant_map(
         .route("/admin/contracts/{contract_id}/validate", axum::routing::post(handlers::validate_event_data_against_schema))
         .route("/subscriptions", axum::routing::post(subscriptions::create_subscription))
         .route("/subscriptions/{id}", get(subscriptions::get_subscription).delete(subscriptions::cancel_subscription))
-        .route("/subscriptions/{id}/ack", axum::routing::post(subscriptions::ack_subscription));
+        .route("/subscriptions/{id}/ack", axum::routing::post(subscriptions::ack_subscription))
+        // #495 Maintenance windows
+        .route("/admin/maintenance-windows", axum::routing::post(crate::notification_admin::create_maintenance_window).get(crate::notification_admin::list_maintenance_windows))
+        .route("/admin/maintenance-windows/{id}", axum::routing::delete(crate::notification_admin::delete_maintenance_window))
+        // #496 Notification audit log
+        .route("/admin/notifications/audit-log", get(crate::notification_admin::get_audit_log))
+        // #497 Template versioning
+        .route("/admin/notification-templates", axum::routing::post(crate::notification_admin::create_template))
+        .route("/admin/notification-templates/{name}/versions", get(crate::notification_admin::list_template_versions))
+        .route("/admin/notification-templates/{name}/activate/{version}", axum::routing::post(crate::notification_admin::activate_template_version));
 
 
     // Unversioned deprecated aliases (same handlers, add Deprecation header via middleware)

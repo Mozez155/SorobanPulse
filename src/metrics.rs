@@ -290,6 +290,21 @@ pub fn increment_sse_lagged_events(connection_id: &str, count: u64) {
     .increment(count);
 }
 
+/// Increment the maintenance window suppression counter (#495).
+pub fn record_notification_maintenance_suppressed() {
+    m::counter!("soroban_pulse_notifications_maintenance_suppressed_total").increment(1);
+}
+
+/// Set the channel health gauge (#498): 1.0 = healthy, 0.0 = unhealthy.
+pub fn set_channel_health(channel_name: &str, channel_type: &str, healthy: bool) {
+    m::gauge!(
+        "soroban_pulse_notification_channel_healthy",
+        "channel" => channel_name.to_string(),
+        "type" => channel_type.to_string()
+    )
+    .set(if healthy { 1.0 } else { 0.0 });
+}
+
 /// Record a slow query (issue #421).
 pub fn record_slow_query(query_type: &str) {
     m::counter!("soroban_pulse_slow_queries_total", "query_type" => query_type.to_string())
