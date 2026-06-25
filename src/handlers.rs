@@ -9894,6 +9894,68 @@ pub async fn get_mask_job_status(
     }))
 }
 
+/// Request body for creating a notification channel (Issue #477).
+#[derive(Debug, serde::Deserialize)]
+pub struct CreateNotificationChannelRequest {
+    pub name: String,
+    pub channel_type: String,
+    /// Channel-specific configuration (URL, recipients, …).
+    #[serde(default)]
+    pub config: Value,
+    /// Optional content filter: only events whose data satisfies the predicate
+    /// are delivered through this channel.
+    #[serde(default)]
+    pub content_filter: Option<crate::content_filter::ContentFilter>,
+}
+
+/// POST /v1/admin/notifications/channels — create a notification channel,
+/// optionally with a content filter (Issue #477).
+///
+/// Invalid content filter expressions are rejected with `400 Bad Request`.
+pub async fn create_notification_channel(
+    State(state): State<AppState>,
+    Json(req): Json<CreateNotificationChannelRequest>,
+) -> Result<(StatusCode, Json<Value>), AppError> {
+    if req.name.trim().is_empty() {
+        return Err(AppError::Validation("name is required".to_string()));
+    }
+    if !matches!(req.channel_type.as_str(), "webhook" | "email" | "sms") {
+        return Err(AppError::Validation(
+            "channel_type must be one of: webhook, email, sms".to_string(),
+        ));
+    }
+
+    // Validate the content filter up front so invalid expressions return 400.
+    let content_filter_json = match req.content_filter {
+        Some(ref cf) => {
+            cf.validate().map_err(AppError::Validation)?;
+            Some(serde_json::to_value(cf).map_err(|e| AppError::Validation(e.to_string()))?)
+        }
+        None => None,
+    };
+
+    let id: Uuid = sqlx::query_scalar(
+        "INSERT INTO notification_channels (name, channel_type, config, content_filter) \
+         VALUES ($1, $2, $3, $4) RETURNING id",
+    )
+    .bind(&req.name)
+    .bind(&req.channel_type)
+    .bind(&req.config)
+    .bind(&content_filter_json)
+    .fetch_one(&state.pool)
+    .await?;
+
+    Ok((
+        StatusCode::CREATED,
+        Json(json!({
+            "id": id,
+            "name": req.name,
+            "channel_type": req.channel_type,
+            "content_filter": content_filter_json,
+        })),
+    ))
+}
+
 async fn mask_events_background(
     pool: &sqlx::PgPool,
     contract_ids: Option<Vec<String>>,

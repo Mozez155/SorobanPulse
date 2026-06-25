@@ -39,6 +39,30 @@ fn env_or_file_or(key: &str, file: &toml::Table, default: &str) -> String {
     env_or_file(key, file).unwrap_or_else(|| default.to_string())
 }
 
+/// Parse the optional webhook content filter (Issue #477) from
+/// `WEBHOOK_CONTENT_FILTER`, which holds a JSON object such as
+/// `{"path":"$.amount","op":"gt","value":"1000000"}`. An unparseable or invalid
+/// filter is logged and ignored so a bad value never disables delivery silently
+/// at startup.
+fn parse_webhook_content_filter() -> Option<crate::content_filter::ContentFilter> {
+    let raw = env::var("WEBHOOK_CONTENT_FILTER")
+        .ok()
+        .filter(|s| !s.trim().is_empty())?;
+    match serde_json::from_str::<crate::content_filter::ContentFilter>(&raw) {
+        Ok(filter) => match filter.validate() {
+            Ok(()) => Some(filter),
+            Err(e) => {
+                tracing::warn!(error = %e, "Ignoring invalid WEBHOOK_CONTENT_FILTER");
+                None
+            }
+        },
+        Err(e) => {
+            tracing::warn!(error = %e, "Ignoring unparseable WEBHOOK_CONTENT_FILTER");
+            None
+        }
+    }
+}
+
 /// Shared operational state updated by the indexer and read by the /status handler.
 pub struct IndexerState {
     pub current_ledger: AtomicU64,
@@ -193,6 +217,9 @@ pub struct Config {
     pub webhook_url: Option<String>,
     pub webhook_secret: Option<String>,
     pub webhook_contract_filter: Vec<String>,
+    /// Optional content filter applied to webhook notifications (Issue #477).
+    /// Only events whose data satisfies the predicate are delivered.
+    pub webhook_content_filter: Option<crate::content_filter::ContentFilter>,
     /// Require HTTPS for webhook URLs (default: false for development, true for production)
     pub webhook_require_https: bool,
     /// Event types to index (empty = all types)
@@ -356,6 +383,7 @@ impl Default for Config {
             webhook_url: None,
             webhook_secret: None,
             webhook_contract_filter: Vec::new(),
+            webhook_content_filter: None,
             indexer_event_types: Vec::new(),
             event_data_encryption_key: None,
             event_data_encryption_key_old: None,
@@ -1104,6 +1132,7 @@ impl Config {
                 .map(|s| s.trim().to_string())
                 .filter(|s| !s.is_empty())
                 .collect(),
+            webhook_content_filter: parse_webhook_content_filter(),
             webhook_require_https: env_or_file("WEBHOOK_REQUIRE_HTTPS", &file)
                 .map(|v| matches!(v.to_ascii_lowercase().as_str(), "true" | "1" | "yes" | "y"))
                 .unwrap_or_else(|| environment.is_production_like()),

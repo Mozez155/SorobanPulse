@@ -7,6 +7,7 @@
 )]
 mod bloom_filter;
 mod config;
+mod content_filter;
 mod db;
 mod email;
 mod encryption;
@@ -195,12 +196,19 @@ async fn main() -> anyhow::Result<()> {
         let webhook_url = webhook_url.clone();
         let webhook_secret = config.webhook_secret.clone();
         let webhook_contract_filter = config.webhook_contract_filter.clone();
+        // Optional content filter (Issue #477): only deliver events whose data
+        // satisfies the predicate.
+        let webhook_content_filter = config.webhook_content_filter.clone();
         let http_client = reqwest::Client::builder()
             .timeout(Duration::from_secs(10))
             .build()
             .expect("Failed to build webhook HTTP client");
 
-        info!(url = %webhook_url, "Webhook delivery enabled");
+        info!(
+            url = %webhook_url,
+            content_filter = ?webhook_content_filter,
+            "Webhook delivery enabled"
+        );
 
         tokio::spawn(async move {
             let mut rx = webhook_rx;
@@ -212,6 +220,12 @@ async fn main() -> anyhow::Result<()> {
                             && !webhook_contract_filter.contains(&event.contract_id)
                         {
                             continue;
+                        }
+                        // Apply content filter if configured (Issue #477).
+                        if let Some(ref cf) = webhook_content_filter {
+                            if !cf.evaluate(&event.value) {
+                                continue;
+                            }
                         }
                         let client = http_client.clone();
                         let url = webhook_url.clone();

@@ -392,6 +392,7 @@ pub fn create_router_with_tx_and_tenant_map(
         .route("/admin/reencrypt", axum::routing::post(handlers::start_reencrypt))
         .route("/admin/mask-events", axum::routing::post(handlers::start_mask_events))
         .route("/admin/mask-events/{job_id}", get(handlers::get_mask_job_status))
+        .route("/admin/notifications/channels", axum::routing::post(handlers::create_notification_channel))
         .route("/admin/contracts/{contract_id}/abi", axum::routing::post(handlers::register_contract_abi).get(handlers::get_contract_abi))
         .route("/admin/events/{id}/anonymize", axum::routing::post(handlers::anonymize_event))
         .route("/admin/events/contract/{contract_id}", axum::routing::delete(handlers::delete_contract_events))

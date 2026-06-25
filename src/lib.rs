@@ -1,6 +1,7 @@
 pub mod abi;
 pub mod bloom_filter;
 pub mod config;
+pub mod content_filter;
 pub mod db;
 pub mod email;
 pub mod encryption;
