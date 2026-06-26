@@ -43,6 +43,47 @@ impl FromStr for NotificationFormat {
     }
 }
 
+/// Notification priority levels (Issue #492).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, utoipa::ToSchema)]
+#[serde(rename_all = "lowercase")]
+pub enum NotificationPriority {
+    Critical,
+    High,
+    Medium,
+    Low,
+}
+
+impl NotificationPriority {
+    pub fn from_str(s: &str) -> Self {
+        match s.to_lowercase().as_str() {
+            "critical" => Self::Critical,
+            "high" => Self::High,
+            "low" => Self::Low,
+            _ => Self::Medium,
+        }
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Critical => "critical",
+            Self::High => "high",
+            Self::Medium => "medium",
+            Self::Low => "low",
+        }
+    }
+
+    /// Returns true when the notification must be delivered immediately rather than batched.
+    pub fn is_immediate(self) -> bool {
+        matches!(self, Self::Critical)
+    }
+}
+
+impl std::fmt::Display for NotificationPriority {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.as_str())
+    }
+}
+
 #[derive(
     Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, sqlx::Type, utoipa::ToSchema,
 )]
@@ -715,6 +756,58 @@ fn default_true() -> bool {
     true
 }
 
+/// A notification channel stored in the database.
+#[derive(Debug, Clone, Serialize, Deserialize, sqlx::FromRow)]
+pub struct NotificationChannel {
+    pub id: Uuid,
+    pub name: String,
+    pub channel_type: String,
+    pub config: Value,
+    pub retry_policy: Value,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+}
+
+/// Request body for creating a notification channel.
+#[derive(Debug, Deserialize)]
+pub struct CreateChannelRequest {
+    pub name: String,
+    pub channel_type: String,
+    pub config: Value,
+    pub retry_policy: Option<Value>,
+}
+
+/// Request body for updating a notification channel (all fields optional.
+#[derive(Debug, Deserialize, Default)]
+pub struct UpdateChannelRequest {
+    pub name: Option<String>,
+    pub config: Option<Value>,
+    pub retry_policy: Option<Value>,
+}
+
+/// Request body for cloning a channel (optional overrides applied to the copy).
+#[derive(Debug, Deserialize, Default)]
+pub struct CloneChannelRequest {
+    pub name: Option<String>,
+    pub config: Option<Value>,
+    pub retry_policy: Option<Value>,
+}
+
+/// Single channel entry inside an import payload.
+#[derive(Debug, Deserialize)]
+pub struct ImportChannelEntry {
+    pub name: String,
+    pub channel_type: String,
+    pub config: Value,
+    pub retry_policy: Option<Value>,
+}
+
+/// Request body for POST /v1/admin/notifications/channels/import.
+#[derive(Debug, Deserialize)]
+pub struct ImportChannelsRequest {
+    pub channels: Vec<ImportChannelEntry>,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -962,3 +1055,119 @@ impl<T> PaginatedResponse<T> {
         }
     }
 }
+
+// ── Notification Channel models (#507 #508 #509 #510) ───────────────────────
+
+/// A managed notification channel (webhook, email, or SMS).
+#[derive(Debug, Clone, Serialize, Deserialize, sqlx::FromRow, utoipa::ToSchema)]
+pub struct NotificationChannel {
+    pub id: Uuid,
+    pub name: String,
+    pub channel_type: String,
+    pub config: Value,
+    pub retry_policy: Value,
+    #[sqlx(default)]
+    pub description: Option<String>,
+    #[sqlx(default)]
+    pub tags: Vec<String>,
+    /// SHA-256 hex of the creator's API key (#508).
+    #[sqlx(default)]
+    pub owner: Option<String>,
+    #[sqlx(default)]
+    pub status: String,
+    #[sqlx(default)]
+    pub contract_filter: Vec<String>,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Deserialize, utoipa::ToSchema)]
+pub struct CreateNotificationChannelRequest {
+    pub name: String,
+    pub channel_type: String,
+    pub config: Value,
+    #[serde(default)]
+    pub retry_policy: Option<Value>,
+    #[serde(default)]
+    pub description: Option<String>,
+    #[serde(default)]
+    pub tags: Vec<String>,
+    #[serde(default)]
+    pub contract_filter: Vec<String>,
+}
+
+#[derive(Debug, Deserialize, utoipa::ToSchema)]
+pub struct UpdateNotificationChannelRequest {
+    pub name: Option<String>,
+    pub config: Option<Value>,
+    pub retry_policy: Option<Value>,
+    pub description: Option<String>,
+    pub tags: Option<Vec<String>>,
+    pub status: Option<String>,
+    pub contract_filter: Option<Vec<String>>,
+}
+
+/// Query parameters for listing/searching notification channels (#509 #510).
+#[derive(Debug, Deserialize, utoipa::IntoParams)]
+pub struct NotificationChannelSearchParams {
+    /// Full-text search on name and description.
+    pub q: Option<String>,
+    pub channel_type: Option<String>,
+    /// Filter by contract_id present in channel's contract_filter list.
+    pub contract_id: Option<String>,
+    pub status: Option<String>,
+    /// Filter by tag (#509).
+    pub tag: Option<String>,
+    pub page: Option<i64>,
+    pub page_size: Option<i64>,
+}
+
+impl NotificationChannelSearchParams {
+    pub fn effective_page(&self) -> i64 {
+        self.page.unwrap_or(1).max(1)
+    }
+    pub fn effective_limit(&self) -> i64 {
+        self.page_size.unwrap_or(20).clamp(1, 100)
+    }
+    pub fn offset(&self) -> i64 {
+        (self.effective_page() - 1) * self.effective_limit()
+    }
+}
+
+#[derive(Debug, Deserialize, utoipa::ToSchema)]
+pub struct AddTagRequest {
+    pub tag: String,
+}
+
+// ── Channel Group models (#507) ──────────────────────────────────────────────
+
+#[derive(Debug, Clone, Serialize, Deserialize, sqlx::FromRow, utoipa::ToSchema)]
+pub struct NotificationChannelGroup {
+    pub id: Uuid,
+    pub name: String,
+    #[sqlx(default)]
+    pub description: Option<String>,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Deserialize, utoipa::ToSchema)]
+pub struct CreateChannelGroupRequest {
+    pub name: String,
+    #[serde(default)]
+    pub description: Option<String>,
+    /// Channel IDs to include in this group.
+    #[serde(default)]
+    pub channel_ids: Vec<Uuid>,
+}
+
+#[derive(Debug, Serialize, utoipa::ToSchema)]
+pub struct ChannelGroupResponse {
+    pub id: Uuid,
+    pub name: String,
+    pub description: Option<String>,
+    pub channel_ids: Vec<Uuid>,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+}
+

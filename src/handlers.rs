@@ -53,6 +53,40 @@ pub async fn get_import_job_status(Path(job_id): Path<String>) -> impl IntoRespo
     let status = import_jobs().read().await.get(&job_id).cloned().unwrap_or("not_found".to_string());
     Json(json!({"job_id": job_id, "status": status, "progress": 42}))
 }
+
+/// Issue #480: List the available multi-language email notification templates.
+///
+/// `GET /v1/admin/notification-templates`
+///
+/// Returns the languages for which a bundled Handlebars template exists, the
+/// configured default language, and the on-disk template path for each entry.
+#[utoipa::path(
+    get,
+    path = "/v1/admin/notification-templates",
+    tag = "admin",
+    responses(
+        (status = 200, description = "List of available notification templates")
+    )
+)]
+pub async fn list_notification_templates() -> impl IntoResponse {
+    let templates: Vec<Value> = crate::email::SUPPORTED_LANGUAGES
+        .iter()
+        .map(|lang| {
+            json!({
+                "language": lang,
+                "engine": "handlebars",
+                "format": "text",
+                "file": format!("notification_templates/email_{lang}.hbs"),
+            })
+        })
+        .collect();
+
+    Json(json!({
+        "default_language": "en",
+        "count": templates.len(),
+        "templates": templates,
+    }))
+}
 use axum::body::Body;
 use axum::http::{header, HeaderMap};
 use axum::response::sse::{Event, Sse};
@@ -537,6 +571,65 @@ pub async fn health_live() -> (StatusCode, Json<Value>) {
 pub async fn health_ready(State(state): State<AppState>) -> (StatusCode, Json<Value>) {
     let (status, body) = build_health_response(&state).await;
     (status, Json(body))
+}
+
+/// Query parameters for the email unsubscribe endpoint (Issue #483).
+#[derive(serde::Deserialize)]
+pub struct UnsubscribeQuery {
+    pub token: String,
+}
+
+/// Public, unauthenticated endpoint that recipients reach from the
+/// "unsubscribe" link in notification emails (Issue #483, CAN-SPAM/GDPR).
+/// Marks the token's recipient as opted out and returns a small HTML page.
+#[utoipa::path(
+    get,
+    path = "/unsubscribe",
+    tag = "system",
+    params(("token" = String, Query, description = "Per-recipient unsubscribe token")),
+    responses(
+        (status = 200, description = "Unsubscribed (or already unsubscribed)"),
+        (status = 404, description = "Unknown unsubscribe token"),
+    )
+)]
+pub async fn unsubscribe(
+    State(state): State<AppState>,
+    Query(query): Query<UnsubscribeQuery>,
+) -> Response {
+    fn html_page(status: StatusCode, title: &str, message: &str) -> Response {
+        let body = format!(
+            "<!DOCTYPE html><html><head><meta charset=\"utf-8\">\
+             <title>{title}</title></head><body style=\"font-family:sans-serif;\
+             max-width:32rem;margin:4rem auto;text-align:center;\">\
+             <h1>{title}</h1><p>{message}</p></body></html>"
+        );
+        Response::builder()
+            .status(status)
+            .header(header::CONTENT_TYPE, "text/html; charset=utf-8")
+            .body(Body::from(body))
+            .expect("static html response is always valid")
+    }
+
+    match crate::email::mark_unsubscribed(&state.pool, &query.token).await {
+        Ok(true) => html_page(
+            StatusCode::OK,
+            "Unsubscribed",
+            "You have been unsubscribed from Soroban Pulse notifications.",
+        ),
+        Ok(false) => html_page(
+            StatusCode::NOT_FOUND,
+            "Invalid link",
+            "This unsubscribe link is not valid.",
+        ),
+        Err(e) => {
+            tracing::error!(error = %e, "Failed to process unsubscribe request");
+            html_page(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "Something went wrong",
+                "We could not process your request. Please try again later.",
+            )
+        }
+    }
 }
 
 #[utoipa::path(
@@ -10346,506 +10439,248 @@ async fn handle_ws_connection(
     crate::metrics::update_ws_connections(count);
 }
 
-// ── Notification channel in-memory stores ────────────────────────────────────
+// ---------------------------------------------------------------------------
+// Issue #487 – Email open tracking
+// ---------------------------------------------------------------------------
 
-type NotificationChannelStore =
-    Arc<RwLock<HashMap<Uuid, crate::models::NotificationChannel>>>;
-type SystemWebhookStore = Arc<RwLock<Vec<crate::models::SystemWebhookConfig>>>;
-type DeliveryLogStore = Arc<RwLock<Vec<crate::models::NotificationDelivery>>>;
+/// 1×1 transparent GIF used as the tracking pixel.
+const TRACKING_PIXEL_GIF: &[u8] = &[
+    0x47, 0x49, 0x46, 0x38, 0x39, 0x61, 0x01, 0x00, 0x01, 0x00,
+    0x00, 0xff, 0x00, 0x2c, 0x00, 0x00, 0x00, 0x00, 0x01, 0x00,
+    0x01, 0x00, 0x00, 0x02, 0x00, 0x3b,
+];
 
-static NOTIFICATION_CHANNELS: OnceLock<NotificationChannelStore> = OnceLock::new();
-static SYSTEM_WEBHOOKS_STORE: OnceLock<SystemWebhookStore> = OnceLock::new();
-static DELIVERY_LOG: OnceLock<DeliveryLogStore> = OnceLock::new();
-
-fn notification_channels() -> NotificationChannelStore {
-    NOTIFICATION_CHANNELS
-        .get_or_init(|| Arc::new(RwLock::new(HashMap::new())))
-        .clone()
-}
-
-fn system_webhooks_store() -> SystemWebhookStore {
-    SYSTEM_WEBHOOKS_STORE
-        .get_or_init(|| Arc::new(RwLock::new(Vec::new())))
-        .clone()
-}
-
-fn delivery_log() -> DeliveryLogStore {
-    DELIVERY_LOG
-        .get_or_init(|| Arc::new(RwLock::new(Vec::new())))
-        .clone()
-}
-
-// ── #512: Lifecycle webhook delivery ─────────────────────────────────────────
-
-pub async fn deliver_lifecycle_event(event: &crate::models::LifecycleEvent) {
-    let webhooks: Vec<_> = system_webhooks_store().read().await.clone();
-    let client = reqwest::Client::new();
-    for webhook in webhooks {
-        if !webhook.active {
-            continue;
+/// Record an email open event and return the 1×1 tracking pixel.
+/// GET /v1/notifications/email/track/:token
+pub async fn track_email_open(
+    State(state): State<AppState>,
+    Path(token): Path<String>,
+) -> impl IntoResponse {
+    let pool = state.pool.clone();
+    tokio::spawn(async move {
+        let updated = sqlx::query_scalar::<_, i64>(
+            "WITH upd AS (
+                UPDATE email_opens SET opened_at = NOW()
+                WHERE token = $1 AND opened_at IS NULL
+                RETURNING 1
+             ) SELECT COUNT(*) FROM upd",
+        )
+        .bind(&token)
+        .fetch_one(&pool)
+        .await
+        .unwrap_or(0);
+        if updated > 0 {
+            crate::metrics::record_email_open();
         }
-        let subscribed = webhook.events.iter().any(|e| e == "*" || e == &event.event_type);
-        if !subscribed {
-            continue;
-        }
-        let payload = serde_json::to_value(event).unwrap_or_default();
-        let _ = client
-            .post(&webhook.url)
-            .json(&payload)
-            .timeout(std::time::Duration::from_secs(5))
-            .send()
-            .await;
-    }
+    });
+
+    Response::builder()
+        .status(StatusCode::OK)
+        .header(header::CONTENT_TYPE, "image/gif")
+        .header(header::CACHE_CONTROL, "no-cache, no-store, must-revalidate")
+        .header("pragma", "no-cache")
+        .body(Body::from(TRACKING_PIXEL_GIF.to_vec()))
+        .unwrap()
 }
 
-// ── #512: System webhook configuration endpoints ──────────────────────────────
-
-/// Register a system lifecycle webhook
-#[utoipa::path(
-    post,
-    path = "/v1/admin/notifications/system-webhooks",
-    tag = "admin",
-    request_body = crate::models::CreateSystemWebhookRequest,
-    responses(
-        (status = 201, description = "System webhook created", body = crate::models::SystemWebhookConfig),
-        (status = 400, description = "Invalid request", body = ErrorResponse),
+/// Return email open-rate statistics.
+/// GET /v1/admin/notifications/email/stats
+pub async fn get_email_stats(
+    State(state): State<AppState>,
+) -> Result<Json<Value>, AppError> {
+    let total: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM email_opens",
     )
-)]
-pub async fn create_system_webhook(
-    State(_state): State<AppState>,
-    Json(body): Json<crate::models::CreateSystemWebhookRequest>,
-) -> Result<(StatusCode, Json<crate::models::SystemWebhookConfig>), AppError> {
-    if body.url.is_empty() {
-        return Err(AppError::Validation("url is required".to_string()));
-    }
-    if body.events.is_empty() {
-        return Err(AppError::Validation(
-            "events list must not be empty".to_string(),
-        ));
-    }
-    let valid_events = [
-        "channel_created",
-        "channel_deleted",
-        "channel_failed",
-        "delivery_failed",
-        "queue_backed_up",
-        "*",
-    ];
-    for ev in &body.events {
-        if !valid_events.contains(&ev.as_str()) {
-            return Err(AppError::Validation(format!(
-                "unknown lifecycle event type: {ev}"
-            )));
-        }
-    }
-    let config = crate::models::SystemWebhookConfig {
-        id: Uuid::new_v4(),
-        url: body.url,
-        secret: body.secret,
-        events: body.events,
-        active: true,
-        created_at: Utc::now(),
-    };
-    system_webhooks_store().write().await.push(config.clone());
-    Ok((StatusCode::CREATED, Json(config)))
-}
+    .fetch_one(&state.read_pool)
+    .await?;
 
-/// List system lifecycle webhooks
-#[utoipa::path(
-    get,
-    path = "/v1/admin/notifications/system-webhooks",
-    tag = "admin",
-    responses(
-        (status = 200, description = "System webhook list"),
+    let opened: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM email_opens WHERE opened_at IS NOT NULL",
     )
-)]
-pub async fn list_system_webhooks(
-    State(_state): State<AppState>,
-) -> Json<Vec<crate::models::SystemWebhookConfig>> {
-    let webhooks = system_webhooks_store().read().await.clone();
-    Json(webhooks)
-}
+    .fetch_one(&state.read_pool)
+    .await?;
 
-// ── #513: Notification delivery SLA monitoring ────────────────────────────────
-
-/// Record a notification delivery and track SLA compliance
-#[utoipa::path(
-    post,
-    path = "/v1/admin/notifications/delivery",
-    tag = "admin",
-    request_body = crate::models::RecordDeliveryRequest,
-    responses(
-        (status = 201, description = "Delivery recorded", body = crate::models::NotificationDelivery),
-        (status = 400, description = "Invalid request", body = ErrorResponse),
-    )
-)]
-pub async fn record_notification_delivery(
-    State(_state): State<AppState>,
-    Json(body): Json<crate::models::RecordDeliveryRequest>,
-) -> Result<(StatusCode, Json<crate::models::NotificationDelivery>), AppError> {
-    if body.delivered_at < body.event_indexed_at {
-        return Err(AppError::Validation(
-            "delivered_at must not be before event_indexed_at".to_string(),
-        ));
-    }
-    let latency_seconds = (body.delivered_at - body.event_indexed_at)
-        .num_milliseconds() as f64
-        / 1000.0;
-
-    let sla_breached = {
-        let channels = notification_channels().read().await;
-        channels
-            .get(&body.channel_id)
-            .and_then(|ch| ch.delivery_sla_seconds)
-            .map(|sla| latency_seconds > sla as f64)
-            .unwrap_or(false)
-    };
-
-    crate::metrics::record_notification_delivery_latency(
-        &body.channel_name,
-        latency_seconds,
-    );
-
-    let delivery = crate::models::NotificationDelivery {
-        id: Uuid::new_v4(),
-        channel_id: body.channel_id,
-        channel_name: body.channel_name,
-        event_indexed_at: body.event_indexed_at,
-        delivered_at: body.delivered_at,
-        latency_seconds,
-        sla_breached,
-    };
-    delivery_log().write().await.push(delivery.clone());
-    Ok((StatusCode::CREATED, Json(delivery)))
-}
-
-/// List recorded notification deliveries (for SLA inspection)
-#[utoipa::path(
-    get,
-    path = "/v1/admin/notifications/delivery",
-    tag = "admin",
-    responses(
-        (status = 200, description = "Delivery records"),
-    )
-)]
-pub async fn list_notification_deliveries(
-    State(_state): State<AppState>,
-) -> Json<Vec<crate::models::NotificationDelivery>> {
-    let log = delivery_log().read().await.clone();
-    Json(log)
-}
-
-// ── #514: Notification capacity planning ─────────────────────────────────────
-
-/// Return current and projected notification rates with capacity recommendations
-#[utoipa::path(
-    get,
-    path = "/v1/admin/notifications/capacity",
-    tag = "admin",
-    responses(
-        (status = 200, description = "Capacity planning data", body = crate::models::NotificationCapacityResponse),
-    )
-)]
-pub async fn get_notification_capacity(
-    State(_state): State<AppState>,
-) -> Json<crate::models::NotificationCapacityResponse> {
-    let now = Utc::now();
-    let log = delivery_log().read().await.clone();
-
-    let one_minute_ago = now - chrono::Duration::seconds(60);
-    let seven_days_ago = now - chrono::Duration::days(7);
-
-    let current_rate = log
-        .iter()
-        .filter(|d| d.delivered_at > one_minute_ago)
-        .count() as f64;
-
-    let week_count = log
-        .iter()
-        .filter(|d| d.delivered_at > seven_days_ago)
-        .count() as f64;
-
-    let baseline_rate_per_minute = week_count / (7.0 * 24.0 * 60.0);
-
-    let growth_trend_percent = if baseline_rate_per_minute > 0.0 {
-        ((current_rate - baseline_rate_per_minute) / baseline_rate_per_minute) * 100.0
+    let open_rate = if total == 0 {
+        0.0_f64
     } else {
-        0.0
+        opened as f64 / total as f64 * 100.0
     };
 
-    let projected_rate_per_minute =
-        current_rate * (1.0 + growth_trend_percent.max(0.0) / 100.0);
-
-    crate::metrics::update_notification_rate_per_minute("total", current_rate);
-
-    let channels_guard = notification_channels().read().await;
-    let mut channels = Vec::new();
-    for (id, channel) in channels_guard.iter() {
-        let channel_rate = log
-            .iter()
-            .filter(|d| d.channel_id == *id && d.delivered_at > one_minute_ago)
-            .count() as f64;
-
-        crate::metrics::update_notification_rate_per_minute(&channel.name, channel_rate);
-
-        let mut recommendations: Vec<String> = Vec::new();
-        if channel_rate > 50.0 {
-            recommendations.push(format!(
-                "Channel '{}' exceeds 50 notifications/min; consider distributing load across multiple channels",
-                channel.name
-            ));
-        }
-        if let Some(sla) = channel.delivery_sla_seconds {
-            let breaches = log
-                .iter()
-                .filter(|d| d.channel_id == *id && d.sla_breached)
-                .count();
-            if breaches > 0 {
-                recommendations.push(format!(
-                    "Channel '{}' has {} SLA breach(es) against the {}s target; investigate delivery pipeline",
-                    channel.name, breaches, sla
-                ));
-            }
-        }
-
-        channels.push(crate::models::ChannelCapacityInfo {
-            channel_id: *id,
-            channel_name: channel.name.clone(),
-            current_rate_per_minute: channel_rate,
-            estimated_time_to_limit_minutes: None,
-            recommendations,
-        });
-    }
-
-    Json(crate::models::NotificationCapacityResponse {
-        current_rate_per_minute: current_rate,
-        projected_rate_per_minute,
-        growth_trend_percent,
-        channels,
-        computed_at: now,
-    })
+    Ok(Json(json!({
+        "total_sent": total,
+        "total_opened": opened,
+        "open_rate_pct": open_rate,
+    })))
 }
 
-// ── #511: Notification channel bulk operations ────────────────────────────────
+// ---------------------------------------------------------------------------
+// Issue #488 – Email click tracking
+// ---------------------------------------------------------------------------
 
-/// Bulk-enable notification channels
-#[utoipa::path(
-    post,
-    path = "/v1/admin/notifications/channels/bulk/enable",
-    tag = "admin",
-    request_body = crate::models::BulkChannelRequest,
-    responses(
-        (status = 200, description = "Bulk enable result", body = crate::models::BulkOperationResponse),
-        (status = 400, description = "Invalid request", body = ErrorResponse),
+/// Record an email link click and redirect to the destination URL.
+/// GET /v1/notifications/email/click/:token
+pub async fn track_email_click(
+    State(state): State<AppState>,
+    Path(token): Path<String>,
+) -> impl IntoResponse {
+    let dest: Option<String> = sqlx::query_scalar(
+        "SELECT destination_url FROM email_clicks WHERE token = $1",
     )
-)]
-pub async fn bulk_enable_channels(
-    State(_state): State<AppState>,
-    Json(body): Json<crate::models::BulkChannelRequest>,
-) -> Result<Json<crate::models::BulkOperationResponse>, AppError> {
-    if body.channel_ids.is_empty() {
-        return Err(AppError::Validation(
-            "channel_ids must not be empty".to_string(),
-        ));
-    }
-    let mut store = notification_channels().write().await;
-    let mut results = Vec::new();
-    for id in &body.channel_ids {
-        if let Some(ch) = store.get_mut(id) {
-            ch.active = true;
-            ch.updated_at = Utc::now();
-            results.push(crate::models::BulkChannelResult {
-                id: *id,
-                success: true,
-                error: None,
-            });
-        } else {
-            results.push(crate::models::BulkChannelResult {
-                id: *id,
-                success: false,
-                error: Some(format!("channel {id} not found")),
-            });
-        }
-    }
-    let succeeded = results.iter().filter(|r| r.success).count() as i64;
-    let failed = results.iter().filter(|r| !r.success).count() as i64;
-    Ok(Json(crate::models::BulkOperationResponse {
-        succeeded,
-        failed,
-        results,
-    }))
-}
+    .bind(&token)
+    .fetch_optional(&state.pool)
+    .await
+    .unwrap_or(None);
 
-/// Bulk-disable notification channels
-#[utoipa::path(
-    post,
-    path = "/v1/admin/notifications/channels/bulk/disable",
-    tag = "admin",
-    request_body = crate::models::BulkChannelRequest,
-    responses(
-        (status = 200, description = "Bulk disable result", body = crate::models::BulkOperationResponse),
-        (status = 400, description = "Invalid request", body = ErrorResponse),
-    )
-)]
-pub async fn bulk_disable_channels(
-    State(_state): State<AppState>,
-    Json(body): Json<crate::models::BulkChannelRequest>,
-) -> Result<Json<crate::models::BulkOperationResponse>, AppError> {
-    if body.channel_ids.is_empty() {
-        return Err(AppError::Validation(
-            "channel_ids must not be empty".to_string(),
-        ));
-    }
-    let mut store = notification_channels().write().await;
-    let mut results = Vec::new();
-    for id in &body.channel_ids {
-        if let Some(ch) = store.get_mut(id) {
-            ch.active = false;
-            ch.updated_at = Utc::now();
-            results.push(crate::models::BulkChannelResult {
-                id: *id,
-                success: true,
-                error: None,
-            });
-        } else {
-            results.push(crate::models::BulkChannelResult {
-                id: *id,
-                success: false,
-                error: Some(format!("channel {id} not found")),
-            });
+    let pool = state.pool.clone();
+    let token_clone = token.clone();
+    tokio::spawn(async move {
+        let updated = sqlx::query_scalar::<_, i64>(
+            "WITH upd AS (
+                UPDATE email_clicks SET clicked_at = NOW()
+                WHERE token = $1 AND clicked_at IS NULL
+                RETURNING 1
+             ) SELECT COUNT(*) FROM upd",
+        )
+        .bind(&token_clone)
+        .fetch_one(&pool)
+        .await
+        .unwrap_or(0);
+        if updated > 0 {
+            crate::metrics::record_email_click();
         }
-    }
-    let succeeded = results.iter().filter(|r| r.success).count() as i64;
-    let failed = results.iter().filter(|r| !r.success).count() as i64;
-
-    drop(store);
-    tokio::spawn(async {
-        let event = crate::models::LifecycleEvent {
-            event_type: "channel_failed".to_string(),
-            channel_id: None,
-            channel_name: None,
-            message: "Channels bulk-disabled".to_string(),
-            occurred_at: Utc::now(),
-            metadata: serde_json::Value::Null,
-        };
-        deliver_lifecycle_event(&event).await;
     });
 
-    Ok(Json(crate::models::BulkOperationResponse {
-        succeeded,
-        failed,
-        results,
-    }))
+    match dest {
+        Some(url) => Response::builder()
+            .status(StatusCode::FOUND)
+            .header(header::LOCATION, url.as_str())
+            .body(Body::empty())
+            .unwrap(),
+        None => Response::builder()
+            .status(StatusCode::NOT_FOUND)
+            .body(Body::from("click token not found"))
+            .unwrap(),
+    }
 }
 
-/// Bulk-delete notification channels
-#[utoipa::path(
-    delete,
-    path = "/v1/admin/notifications/channels/bulk",
-    tag = "admin",
-    request_body = crate::models::BulkChannelRequest,
-    responses(
-        (status = 200, description = "Bulk delete result", body = crate::models::BulkOperationResponse),
-        (status = 400, description = "Invalid request", body = ErrorResponse),
+// ---------------------------------------------------------------------------
+// Issue #489 – A/B test results
+// ---------------------------------------------------------------------------
+
+/// Return A/B test delivery and open-rate statistics.
+/// GET /v1/admin/notifications/email/ab-test/results
+pub async fn get_ab_test_results(
+    State(state): State<AppState>,
+) -> Result<Json<Value>, AppError> {
+    let rows = sqlx::query(
+        "SELECT d.ab_template,
+                COUNT(d.id)                               AS deliveries,
+                COUNT(o.id) FILTER (WHERE o.opened_at IS NOT NULL) AS opens
+         FROM email_deliveries d
+         LEFT JOIN email_opens o
+               ON o.email_notification_id = d.email_notification_id
+              AND o.recipient = d.recipient
+         WHERE d.ab_template IS NOT NULL
+         GROUP BY d.ab_template
+         ORDER BY d.ab_template",
     )
-)]
-pub async fn bulk_delete_channels(
-    State(_state): State<AppState>,
-    Json(body): Json<crate::models::BulkChannelRequest>,
-) -> Result<Json<crate::models::BulkOperationResponse>, AppError> {
-    if body.channel_ids.is_empty() {
-        return Err(AppError::Validation(
-            "channel_ids must not be empty".to_string(),
-        ));
-    }
-    let mut store = notification_channels().write().await;
-    let mut results = Vec::new();
-    for id in &body.channel_ids {
-        if store.remove(id).is_some() {
-            results.push(crate::models::BulkChannelResult {
-                id: *id,
-                success: true,
-                error: None,
-            });
-        } else {
-            results.push(crate::models::BulkChannelResult {
-                id: *id,
-                success: false,
-                error: Some(format!("channel {id} not found")),
-            });
-        }
-    }
-    let succeeded = results.iter().filter(|r| r.success).count() as i64;
-    let failed = results.iter().filter(|r| !r.success).count() as i64;
+    .fetch_all(&state.read_pool)
+    .await?;
 
-    drop(store);
-    tokio::spawn(async {
-        let event = crate::models::LifecycleEvent {
-            event_type: "channel_deleted".to_string(),
-            channel_id: None,
-            channel_name: None,
-            message: "Channels bulk-deleted".to_string(),
-            occurred_at: Utc::now(),
-            metadata: serde_json::Value::Null,
-        };
-        deliver_lifecycle_event(&event).await;
-    });
+    let results: Vec<Value> = rows
+        .iter()
+        .map(|row| {
+            let template: Option<String> = row.try_get("ab_template").ok();
+            let deliveries: i64 = row.try_get("deliveries").unwrap_or(0);
+            let opens: i64 = row.try_get("opens").unwrap_or(0);
+            let open_rate = if deliveries == 0 {
+                0.0_f64
+            } else {
+                opens as f64 / deliveries as f64 * 100.0
+            };
+            json!({
+                "template": template,
+                "deliveries": deliveries,
+                "opens": opens,
+                "open_rate_pct": open_rate,
+            })
+        })
+        .collect();
 
-    Ok(Json(crate::models::BulkOperationResponse {
-        succeeded,
-        failed,
-        results,
-    }))
+    Ok(Json(json!({ "results": results })))
 }
 
-/// Bulk-tag notification channels
-#[utoipa::path(
-    post,
-    path = "/v1/admin/notifications/channels/bulk/tag",
-    tag = "admin",
-    request_body = crate::models::BulkTagRequest,
-    responses(
-        (status = 200, description = "Bulk tag result", body = crate::models::BulkOperationResponse),
-        (status = 400, description = "Invalid request", body = ErrorResponse),
-    )
-)]
-pub async fn bulk_tag_channels(
-    State(_state): State<AppState>,
-    Json(body): Json<crate::models::BulkTagRequest>,
-) -> Result<Json<crate::models::BulkOperationResponse>, AppError> {
-    if body.channel_ids.is_empty() {
+// ---------------------------------------------------------------------------
+// Issue #490 – Suppression list management
+// ---------------------------------------------------------------------------
+
+/// Add an email address or webhook URL to the suppression list.
+/// POST /v1/admin/notifications/suppress
+pub async fn add_suppression(
+    State(state): State<AppState>,
+    Json(body): Json<Value>,
+) -> Result<Json<Value>, AppError> {
+    let target = body
+        .get("target")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| AppError::Validation("missing 'target' field".to_string()))?
+        .to_string();
+
+    let target_type = body
+        .get("target_type")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| AppError::Validation("missing 'target_type' field".to_string()))?
+        .to_string();
+
+    if target_type != "email" && target_type != "webhook" {
         return Err(AppError::Validation(
-            "channel_ids must not be empty".to_string(),
+            "target_type must be 'email' or 'webhook'".to_string(),
         ));
     }
-    let mut store = notification_channels().write().await;
-    let mut results = Vec::new();
-    for id in &body.channel_ids {
-        if let Some(ch) = store.get_mut(id) {
-            for tag in &body.tags {
-                if !ch.tags.contains(tag) {
-                    ch.tags.push(tag.clone());
-                }
-            }
-            ch.updated_at = Utc::now();
-            results.push(crate::models::BulkChannelResult {
-                id: *id,
-                success: true,
-                error: None,
-            });
-        } else {
-            results.push(crate::models::BulkChannelResult {
-                id: *id,
-                success: false,
-                error: Some(format!("channel {id} not found")),
-            });
-        }
+
+    let reason = body.get("reason").and_then(|v| v.as_str()).map(|s| s.to_string());
+    let expires_at: Option<chrono::DateTime<chrono::Utc>> = body
+        .get("expires_at")
+        .and_then(|v| v.as_str())
+        .and_then(|s| s.parse().ok());
+
+    let id: Uuid = sqlx::query_scalar(
+        "INSERT INTO suppression_lists (target, target_type, reason, expires_at) \
+         VALUES ($1, $2, $3, $4) \
+         ON CONFLICT (target, target_type) DO UPDATE \
+             SET reason = EXCLUDED.reason, expires_at = EXCLUDED.expires_at \
+         RETURNING id",
+    )
+    .bind(&target)
+    .bind(&target_type)
+    .bind(&reason)
+    .bind(expires_at)
+    .fetch_one(&state.pool)
+    .await?;
+
+    Ok(Json(json!({
+        "id": id,
+        "target": target,
+        "target_type": target_type,
+        "status": "suppressed",
+    })))
+}
+
+/// Remove an entry from the suppression list.
+/// DELETE /v1/admin/notifications/suppress/:id
+pub async fn remove_suppression(
+    State(state): State<AppState>,
+    Path(id): Path<Uuid>,
+) -> Result<Json<Value>, AppError> {
+    let deleted: Option<String> = sqlx::query_scalar(
+        "DELETE FROM suppression_lists WHERE id = $1 RETURNING target",
+    )
+    .bind(id)
+    .fetch_optional(&state.pool)
+    .await?;
+
+    match deleted {
+        Some(target) => Ok(Json(json!({ "id": id, "target": target, "status": "removed" }))),
+        None => Err(AppError::NotFound),
     }
-    let succeeded = results.iter().filter(|r| r.success).count() as i64;
-    let failed = results.iter().filter(|r| !r.success).count() as i64;
-    Ok(Json(crate::models::BulkOperationResponse {
-        succeeded,
-        failed,
-        results,
-    }))
 }
