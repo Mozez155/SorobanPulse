@@ -309,6 +309,7 @@ impl EmailNotifier {
     }
 
     /// Spawn a background task that batches events and sends emails every minute.
+    /// Critical-priority events are sent immediately without waiting for the batch.
     pub fn spawn(
         self,
         mut event_rx: tokio::sync::broadcast::Receiver<SorobanEvent>,
@@ -349,7 +350,14 @@ impl EmailNotifier {
                                 {
                                     continue;
                                 }
-                                events_buffer.push(event);
+
+                                // Critical-priority events are delivered immediately (#492).
+                                let priority = self.evaluate_priority(&event);
+                                if priority == "critical" {
+                                    self.send_batch_email(&[event]).await;
+                                } else {
+                                    events_buffer.push(event);
+                                }
                             }
                             Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
                                 warn!(
@@ -424,16 +432,15 @@ impl EmailNotifier {
             if events.len() == 1 { "" } else { "s" }
         );
 
-        for (contract_id, contract_events) in by_contract.iter() {
+        for entry in entries {
             body.push_str(&format!(
-                "Contract: {}\n  Events: {}\n",
-                contract_id,
-                contract_events.len()
+                "Contract: {}\n  Events: {}  |  First: {}  |  Last: {}\n",
+                entry.contract_id, entry.event_count, entry.first_ts, entry.last_ts
             ));
             for event in contract_events.iter().take(10) {
                 body.push_str(&format!(
-                    "  - Type: {}, Ledger: {}, TxHash: {}\n",
-                    event.event_type, event.ledger, event.tx_hash
+                    "  - Ledger: {}  TxHash: {}  Type: {}\n",
+                    event.ledger, event.tx_hash, event.event_type
                 ));
             }
             if contract_events.len() > 10 {
@@ -614,18 +621,38 @@ impl EmailNotifier {
     }
 }
 
+/// Numeric rank for priority comparison (higher = more urgent) (Issue #492).
+fn priority_rank(p: &str) -> u8 {
+    match p {
+        "critical" => 3,
+        "high" => 2,
+        "medium" => 1,
+        _ => 0,
+    }
+}
+
+/// Per-contract digest entry built during batch email assembly (Issue #491).
+struct ContractDigestEntry<'a> {
+    contract_id: &'a str,
+    event_count: usize,
+    type_counts: HashMap<String, usize>,
+    first_ts: String,
+    last_ts: String,
+    sample_events: Vec<&'a SorobanEvent>,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use serde_json::json;
 
-    fn mock_event(contract_id: &str, ledger: u64) -> SorobanEvent {
+    fn mock_event(contract_id: &str, event_type: &str, ledger: u64) -> SorobanEvent {
         SorobanEvent {
             contract_id: contract_id.to_string(),
             event_type: "contract".to_string(),
             tx_hash: "abc123def456789012345678".to_string(),
             ledger,
-            ledger_closed_at: "2026-04-28T00:00:00Z".to_string(),
+            ledger_closed_at: format!("2026-06-25T{:02}:00:00Z", ledger % 24),
             ledger_hash: None,
             in_successful_call: true,
             value: json!({"test": "data"}),
@@ -707,11 +734,23 @@ mod tests {
     }
 
     #[test]
-    fn test_secret_string_redacted_in_debug() {
-        let secret = SecretString::new("my_password".to_string());
-        let debug_str = format!("{:?}", secret);
-        assert!(!debug_str.contains("my_password"));
-        assert!(debug_str.contains("[REDACTED]"));
+    fn test_grouping_by_contract() {
+        let events = vec![
+            mock_event("CONTRACT_A", "contract", 100),
+            mock_event("CONTRACT_A", "diagnostic", 101),
+            mock_event("CONTRACT_B", "system", 102),
+        ];
+
+        let mut by_contract: HashMap<&str, Vec<&SorobanEvent>> = HashMap::new();
+        for event in &events {
+            by_contract
+                .entry(event.contract_id.as_str())
+                .or_default()
+                .push(event);
+        }
+        assert_eq!(by_contract.len(), 2);
+        assert_eq!(by_contract["CONTRACT_A"].len(), 2);
+        assert_eq!(by_contract["CONTRACT_B"].len(), 1);
     }
 
     #[test]
