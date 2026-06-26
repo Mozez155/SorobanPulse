@@ -21,7 +21,6 @@
 /// ```bash
 /// cargo test --test pact_contract_tests
 /// ```
-
 use serde_json::json;
 
 /// Events API Contract Tests
@@ -71,8 +70,14 @@ mod events_api_contracts {
 
         // Contract verification assertions
         assert_eq!(request.get("method").and_then(|v| v.as_str()), Some("GET"));
-        assert!(response_schema.get("body").and_then(|b| b.get("data")).is_some());
-        assert!(response_schema.get("body").and_then(|b| b.get("total")).is_some());
+        assert!(response_schema
+            .get("body")
+            .and_then(|b| b.get("data"))
+            .is_some());
+        assert!(response_schema
+            .get("body")
+            .and_then(|b| b.get("total"))
+            .is_some());
     }
 
     /// Contract: GET /v1/events with filters
@@ -116,9 +121,18 @@ mod events_api_contracts {
         });
 
         // Contract assertions
-        assert!(request.get("query").and_then(|q| q.get("contract_id")).is_some());
-        assert!(request.get("query").and_then(|q| q.get("from_ledger")).is_some());
-        assert!(response_body.get("data").and_then(|d| d.get(0).and_then(|e| e.get("ledger"))).is_some());
+        assert!(request
+            .get("query")
+            .and_then(|q| q.get("contract_id"))
+            .is_some());
+        assert!(request
+            .get("query")
+            .and_then(|q| q.get("from_ledger"))
+            .is_some());
+        assert!(response_body
+            .get("data")
+            .and_then(|d| d.get(0).and_then(|e| e.get("ledger")))
+            .is_some());
     }
 
     /// Contract: GET /v1/events/{contract_id}
@@ -230,7 +244,9 @@ mod events_api_contracts {
 
         // Contract assertions
         assert_eq!(
-            response_headers.get("content-type").and_then(|v| v.as_str()),
+            response_headers
+                .get("content-type")
+                .and_then(|v| v.as_str()),
             Some("text/event-stream")
         );
     }
@@ -260,8 +276,14 @@ mod error_response_contracts {
         });
 
         assert_eq!(error_response.get("status"), Some(&json!(400)));
-        assert!(error_response.get("body").and_then(|b| b.get("error")).is_some());
-        assert!(error_response.get("body").and_then(|b| b.get("code")).is_some());
+        assert!(error_response
+            .get("body")
+            .and_then(|b| b.get("error"))
+            .is_some());
+        assert!(error_response
+            .get("body")
+            .and_then(|b| b.get("code"))
+            .is_some());
     }
 
     /// Contract: 401 Unauthorized format
@@ -338,7 +360,10 @@ mod error_response_contracts {
         });
 
         assert_eq!(error_response.get("status"), Some(&json!(429)));
-        assert!(error_response.get("headers").and_then(|h| h.get("retry-after")).is_some());
+        assert!(error_response
+            .get("headers")
+            .and_then(|h| h.get("retry-after"))
+            .is_some());
     }
 
     /// Contract: 500 Internal Server Error format
@@ -365,7 +390,10 @@ mod error_response_contracts {
             .and_then(|b| b.get("error"))
             .and_then(|e| e.as_str())
             .unwrap_or("");
-        assert!(!error_msg.contains("panic"), "Error message should not contain panic details");
+        assert!(
+            !error_msg.contains("panic"),
+            "Error message should not contain panic details"
+        );
     }
 
     /// Contract: 503 Service Unavailable format
@@ -414,7 +442,10 @@ mod health_check_contracts {
 
         assert_eq!(response.get("status"), Some(&json!(200)));
         assert_eq!(
-            response.get("body").and_then(|b| b.get("status")).and_then(|s| s.as_str()),
+            response
+                .get("body")
+                .and_then(|b| b.get("status"))
+                .and_then(|s| s.as_str()),
             Some("alive")
         );
     }
@@ -439,7 +470,10 @@ mod health_check_contracts {
 
         assert_eq!(response.get("status"), Some(&json!(200)));
         assert_eq!(
-            response.get("body").and_then(|b| b.get("db")).and_then(|d| d.as_str()),
+            response
+                .get("body")
+                .and_then(|b| b.get("db"))
+                .and_then(|d| d.as_str()),
             Some("ok")
         );
     }
@@ -568,7 +602,11 @@ mod api_versioning_contracts {
         ];
 
         for endpoint in versioned_endpoints {
-            assert!(endpoint.starts_with("/v1/"), "Endpoint {} should be versioned", endpoint);
+            assert!(
+                endpoint.starts_with("/v1/"),
+                "Endpoint {} should be versioned",
+                endpoint
+            );
         }
     }
 
@@ -586,7 +624,10 @@ mod api_versioning_contracts {
         });
 
         assert_eq!(
-            response.get("headers").and_then(|h| h.get("deprecation")).and_then(|d| d.as_str()),
+            response
+                .get("headers")
+                .and_then(|h| h.get("deprecation"))
+                .and_then(|d| d.as_str()),
             Some("true")
         );
     }
@@ -618,11 +659,17 @@ mod ndjson_response_contracts {
         });
 
         assert_eq!(
-            request.get("headers").and_then(|h| h.get("accept")).and_then(|a| a.as_str()),
+            request
+                .get("headers")
+                .and_then(|h| h.get("accept"))
+                .and_then(|a| a.as_str()),
             Some("application/x-ndjson")
         );
         assert_eq!(
-            response.get("headers").and_then(|h| h.get("content-type")).and_then(|c| c.as_str()),
+            response
+                .get("headers")
+                .and_then(|h| h.get("content-type"))
+                .and_then(|c| c.as_str()),
             Some("application/x-ndjson")
         );
     }

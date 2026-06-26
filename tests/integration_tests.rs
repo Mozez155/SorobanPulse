@@ -776,9 +776,18 @@ async fn stats_requires_auth_when_key_configured(pool: PgPool) {
 async fn contract_history_returns_daily_buckets_from_matview(pool: PgPool) {
     let contract_id = "CH23456789012345678901234567890123456789012345678901234X";
     for (day, tx_hash) in [
-        ("2026-05-28T12:00:00Z", "100000000000000000000000000000000000000000000000000000000000000a"),
-        ("2026-05-28T13:00:00Z", "100000000000000000000000000000000000000000000000000000000000000b"),
-        ("2026-05-30T12:00:00Z", "100000000000000000000000000000000000000000000000000000000000000c"),
+        (
+            "2026-05-28T12:00:00Z",
+            "100000000000000000000000000000000000000000000000000000000000000a",
+        ),
+        (
+            "2026-05-28T13:00:00Z",
+            "100000000000000000000000000000000000000000000000000000000000000b",
+        ),
+        (
+            "2026-05-30T12:00:00Z",
+            "100000000000000000000000000000000000000000000000000000000000000c",
+        ),
     ] {
         sqlx::query(
             "INSERT INTO events (contract_id, event_type, tx_hash, ledger, timestamp, event_data)
@@ -791,7 +800,10 @@ async fn contract_history_returns_daily_buckets_from_matview(pool: PgPool) {
         .await
         .unwrap();
     }
-    sqlx::query("REFRESH MATERIALIZED VIEW mv_contract_summary").execute(&pool).await.unwrap();
+    sqlx::query("REFRESH MATERIALIZED VIEW mv_contract_summary")
+        .execute(&pool)
+        .await
+        .unwrap();
 
     let app = make_router(pool, None);
     let resp = app.oneshot(Request::builder()
@@ -837,9 +849,15 @@ async fn related_tx_endpoint_follows_event_data_tx_hash_references(pool: PgPool)
     .unwrap();
 
     let app = make_router(pool, None);
-    let resp = app.oneshot(Request::builder()
-        .uri(format!("/v1/events/tx/{root}/related?depth=1"))
-        .body(Body::empty()).unwrap()).await.unwrap();
+    let resp = app
+        .oneshot(
+            Request::builder()
+                .uri(format!("/v1/events/tx/{root}/related?depth=1"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
 
     assert_eq!(resp.status(), StatusCode::OK);
     let body: serde_json::Value =
@@ -864,16 +882,29 @@ async fn abi_registration_retrieval_and_backfill_decoded_data(pool: PgPool) {
 
     let app = make_router(pool.clone(), None);
     let abi = serde_json::json!([{"name": "transfer", "inputs": [{"name": "from"}, {"name": "to"}, {"name": "amount"}]}]);
-    let resp = app.clone().oneshot(Request::builder()
-        .method("POST")
-        .uri(format!("/v1/admin/contracts/{contract_id}/abi"))
-        .header(header::CONTENT_TYPE, "application/json")
-        .body(Body::from(abi.to_string())).unwrap()).await.unwrap();
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(format!("/v1/admin/contracts/{contract_id}/abi"))
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(abi.to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
     assert_eq!(resp.status(), StatusCode::OK);
 
-    let resp = app.oneshot(Request::builder()
-        .uri(format!("/v1/admin/contracts/{contract_id}/abi"))
-        .body(Body::empty()).unwrap()).await.unwrap();
+    let resp = app
+        .oneshot(
+            Request::builder()
+                .uri(format!("/v1/admin/contracts/{contract_id}/abi"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
     assert_eq!(resp.status(), StatusCode::OK);
 
     for _ in 0..20 {
@@ -935,7 +966,10 @@ async fn get_events_by_contract_invalid_id_returns_400(pool: PgPool) {
     assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
     let body: serde_json::Value =
         serde_json::from_slice(&to_bytes(resp.into_body(), usize::MAX).await.unwrap()).unwrap();
-    assert!(body["error"].as_str().unwrap().contains("invalid contract_id"));
+    assert!(body["error"]
+        .as_str()
+        .unwrap()
+        .contains("invalid contract_id"));
 }
 
 // --- GET /v1/events/tx/{tx_hash} with valid hash ---

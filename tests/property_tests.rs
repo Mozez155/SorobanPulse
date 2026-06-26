@@ -16,7 +16,6 @@
 /// - Timestamp parsing follows ISO 8601 consistently
 /// - Limit clamping respects min/max bounds
 /// - Filter validation rejects invalid patterns consistently
-
 use chrono::{DateTime, Utc};
 use proptest::prelude::*;
 use std::str::FromStr;
@@ -38,25 +37,18 @@ fn ledger_strategy() -> impl Strategy<Value = i64> {
 
 /// Strategy for generating valid contract IDs (Stellar contract format)
 fn contract_id_strategy() -> impl Strategy<Value = String> {
-    prop::string::string_regex("C[A-Z2-7]{55}")
-        .expect("valid contract ID regex")
+    prop::string::string_regex("C[A-Z2-7]{55}").expect("valid contract ID regex")
 }
 
 /// Strategy for generating valid transaction hashes
 fn tx_hash_strategy() -> impl Strategy<Value = String> {
-    prop::string::string_regex("[a-f0-9]{64}")
-        .expect("valid tx hash regex")
+    prop::string::string_regex("[a-f0-9]{64}").expect("valid tx hash regex")
 }
 
 /// Strategy for generating valid ISO 8601 timestamps
 fn iso8601_timestamp_strategy() -> impl Strategy<Value = DateTime<Utc>> {
     (1970i32..2100i32)
-        .prop_flat_map(|year| {
-            (
-                Just(year),
-                1i32..=12i32,
-            )
-        })
+        .prop_flat_map(|year| (Just(year), 1i32..=12i32))
         .prop_flat_map(|(year, month)| {
             let days_in_month = match month {
                 2 if year % 4 == 0 && (year % 100 != 0 || year % 400 == 0) => 29,
@@ -64,11 +56,7 @@ fn iso8601_timestamp_strategy() -> impl Strategy<Value = DateTime<Utc>> {
                 4 | 6 | 9 | 11 => 30,
                 _ => 31,
             };
-            (
-                Just(year),
-                Just(month),
-                1i32..=days_in_month,
-            )
+            (Just(year), Just(month), 1i32..=days_in_month)
         })
         .prop_flat_map(|(year, month, day)| {
             (
