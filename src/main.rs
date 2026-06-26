@@ -38,6 +38,7 @@ mod schema_validator;
 mod stats_refresh;
 mod subscriptions;
 mod webhook;
+mod webhook_verification;
 mod notification_rate_limit;
 mod notification_formatter;
 mod pagerduty;
