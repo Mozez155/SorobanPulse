@@ -243,27 +243,12 @@ async fn main() -> anyhow::Result<()> {
         if let Some(ref from) = config.email_from {
             if !config.email_to.is_empty() {
                 let email_rx = event_tx.subscribe();
-
-                // DKIM signing (Issue #485): load and validate the signing key
-                // up-front so misconfiguration fails startup with a clear error.
-                let (dkim_selector, dkim_private_key) =
-                    if let Some(path) = &config.dkim_private_key_path {
-                        let selector = config.dkim_selector.clone().ok_or_else(|| {
-                            anyhow::anyhow!(
-                                "DKIM_PRIVATE_KEY_PATH is set but DKIM_SELECTOR is missing"
-                            )
-                        })?;
-                        let pem = std::fs::read_to_string(path).map_err(|e| {
-                            anyhow::anyhow!("Failed to read DKIM_PRIVATE_KEY_PATH '{path}': {e}")
-                        })?;
-                        email::validate_dkim_key(&pem)
-                            .map_err(|e| anyhow::anyhow!("DKIM key validation failed: {e}"))?;
-                        info!(selector = %selector, "DKIM signing enabled for outgoing email");
-                        (Some(selector), Some(secrecy::SecretString::new(pem)))
-                    } else {
-                        (None, None)
-                    };
-
+                // Base URL for unsubscribe links (Issue #483): honor the
+                // configured public URL, otherwise fall back to localhost:<port>.
+                let base_url = config
+                    .email_public_base_url
+                    .clone()
+                    .unwrap_or_else(|| format!("http://localhost:{}", config.port));
                 let notifier = email::EmailNotifier::new(
                     smtp_host.clone(),
                     config.email_smtp_port,
@@ -274,8 +259,7 @@ async fn main() -> anyhow::Result<()> {
                     config.email_contract_filter.clone(),
                     config.email_retry_policy.clone(),
                     pool.clone(),
-                    dkim_selector,
-                    dkim_private_key,
+                    base_url,
                 );
 
                 info!(

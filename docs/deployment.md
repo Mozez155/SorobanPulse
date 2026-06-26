@@ -780,53 +780,53 @@ Expected output on PostgreSQL 14+:
 
 ---
 
-## Email Deliverability: DKIM Signing
+## Email Bounce Handling
 
-DKIM (DomainKeys Identified Mail) cryptographically signs outgoing emails so
-recipient mail servers can verify they were authorized by your domain. Without
-DKIM, notification emails are far more likely to be classified as spam.
+The email notification system suppresses addresses that have bounced (invalid
+mailbox, mailbox full, etc.). Continuing to send to bouncing addresses harms
+the sender's reputation and reduces deliverability for everyone, so bounced
+recipients are stored in the `email_bounces` table and skipped on future sends.
 
-### Configuration
+### Bounce webhook endpoint
 
-| Variable | Description |
-|----------|-------------|
-| `DKIM_PRIVATE_KEY_PATH` | Path to a PEM-encoded RSA private key. When set, all outgoing emails are DKIM-signed. |
-| `DKIM_SELECTOR` | The DKIM selector, published in DNS as `<selector>._domainkey.<domain>`. Required when `DKIM_PRIVATE_KEY_PATH` is set. |
-
-The signing domain is derived from the `EMAIL_FROM` address.
-
-### Generating a key pair
-
-```bash
-# 1. Generate a 2048-bit RSA private key
-openssl genrsa -out dkim_private.pem 2048
-
-# 2. Extract the public key for the DNS record
-openssl rsa -in dkim_private.pem -pubout -outform der 2>/dev/null \
-  | openssl base64 -A
-```
-
-### Publishing the DNS record
-
-Create a TXT record at `<selector>._domainkey.<your-domain>` (e.g.
-`pulse._domainkey.example.com`):
+Configure your email provider to POST bounce notifications to:
 
 ```
-v=DKIM1; k=rsa; p=<base64-public-key-from-step-2>
+POST /v1/notifications/email/bounce
 ```
 
-### Enabling in the service
+The endpoint accepts the native bounce payloads of the three common providers
+and extracts the bounced address(es) from each:
 
-```bash
-DKIM_PRIVATE_KEY_PATH=/run/secrets/dkim_private.pem
-DKIM_SELECTOR=pulse
-EMAIL_FROM=soroban-pulse@example.com
+- **SendGrid** — the [Event Webhook](https://docs.sendgrid.com/for-developers/tracking-events/getting-started-event-webhook)
+  posts a JSON array of events; `bounce`, `dropped` and `blocked` events are recorded.
+- **AWS SES** — bounce notifications delivered directly or via an SNS
+  subscription (the SNS `Message` envelope is unwrapped automatically).
+- **Mailgun** — both the modern `event-data` webhook and the legacy flat payload
+  (`failed` / `bounced` / `dropped` / `rejected`).
+
+The endpoint is under `/v1`, so it requires the standard `API_KEY` if one is
+configured. Most providers let you add a custom `Authorization` header (or an
+API key query parameter) to the webhook configuration — use that to authenticate.
+
+The response reports how many bounced addresses were received and recorded:
+
+```json
+{ "received": 1, "recorded": 1 }
 ```
 
-### Startup validation
+### Monitoring
 
-On startup the service reads and validates the DKIM key. If the key is missing,
-unreadable, or not a valid RSA private key — or if `DKIM_PRIVATE_KEY_PATH` is set
-without `DKIM_SELECTOR` — startup **fails with a clear error** rather than
-silently sending unsigned mail. Verify a successful start by looking for the
-`DKIM signing enabled for outgoing email` log line.
+Each recorded bounce increments the `soroban_pulse_email_bounces_total`
+Prometheus counter. A rising bounce rate is an early warning that the recipient
+list contains stale addresses or that the sending domain's reputation is
+degrading.
+
+### Clearing a bounce
+
+If an address was suppressed in error (e.g. a transient mailbox-full bounce),
+delete its row to resume delivery:
+
+```sql
+DELETE FROM email_bounces WHERE email = 'user@example.com';
+```

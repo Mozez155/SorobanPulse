@@ -250,11 +250,10 @@ pub struct Config {
     pub email_from: Option<String>,
     pub email_to: Vec<String>,
     pub email_contract_filter: Vec<String>,
-    /// Path to the PEM-encoded RSA private key used for DKIM signing (Issue #485).
-    /// When set, all outgoing notification emails are DKIM-signed.
-    pub dkim_private_key_path: Option<String>,
-    /// DKIM selector published in DNS as `<selector>._domainkey.<domain>` (Issue #485).
-    pub dkim_selector: Option<String>,
+    /// Public base URL used to build unsubscribe links in emails (Issue #483).
+    /// e.g. `https://pulse.example.com`. When unset, defaults to
+    /// `http://localhost:<PORT>`.
+    pub email_public_base_url: Option<String>,
     // SMS notification fields (Issue #473)
     pub twilio_account_sid: Option<String>,
     pub twilio_auth_token: Option<SecretString>,
@@ -390,8 +389,7 @@ impl Default for Config {
             email_from: None,
             email_to: Vec::new(),
             email_contract_filter: Vec::new(),
-            dkim_private_key_path: None,
-            dkim_selector: None,
+            email_public_base_url: None,
             redis_url: None,
             redis_stream_key: None,
             redis_buffer_max_size: 10_000,
@@ -1176,8 +1174,7 @@ impl Config {
                         .collect()
                 })
                 .unwrap_or_default(),
-            dkim_private_key_path: env_or_file("DKIM_PRIVATE_KEY_PATH", &file),
-            dkim_selector: env_or_file("DKIM_SELECTOR", &file),
+            email_public_base_url: env_or_file("EMAIL_PUBLIC_BASE_URL", &file),
             redis_url: env_or_file("REDIS_URL", &file),
             redis_stream_key: env_or_file("REDIS_STREAM_KEY", &file),
             redis_buffer_max_size: env_or_file("REDIS_BUFFER_MAX_SIZE", &file)
