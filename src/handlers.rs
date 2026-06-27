@@ -11029,3 +11029,94 @@ pub async fn remove_suppression(
         None => Err(AppError::NotFound),
     }
 }
+
+/// Return current PostgreSQL streaming replication status.
+#[utoipa::path(
+    get,
+    path = "/v1/admin/replication/status",
+    tag = "admin",
+    responses(
+        (status = 200, description = "Replication status"),
+        (status = 401, description = "Unauthorized", body = ErrorResponse),
+    )
+)]
+pub async fn get_replication_status(State(state): State<AppState>) -> Json<Value> {
+    let replicas = crate::replica_monitor::query_replication_status(&state.pool).await;
+    Json(json!({
+        "replica_count": replicas.len(),
+        "replicas": replicas,
+    }))
+}
+
+/// List all feature flags and their current state.
+#[utoipa::path(
+    get,
+    path = "/v1/admin/feature-flags",
+    tag = "admin",
+    responses(
+        (status = 200, description = "Feature flags list"),
+        (status = 401, description = "Unauthorized", body = ErrorResponse),
+    )
+)]
+pub async fn list_feature_flags(State(state): State<AppState>) -> Result<Json<Value>, AppError> {
+    let rows: Vec<(uuid::Uuid, String, bool, bool, f64, Option<String>)> = sqlx::query_as(
+        "SELECT id, name, enabled, auto_rollback, rollback_threshold, description
+         FROM feature_flags ORDER BY name",
+    )
+    .fetch_all(&state.pool)
+    .await?;
+
+    let flags: Vec<Value> = rows
+        .into_iter()
+        .map(|(id, name, enabled, auto_rollback, threshold, description)| {
+            json!({
+                "id": id,
+                "name": name,
+                "enabled": enabled,
+                "auto_rollback": auto_rollback,
+                "rollback_threshold": threshold,
+                "description": description,
+            })
+        })
+        .collect();
+
+    Ok(Json(json!({ "flags": flags, "count": flags.len() })))
+}
+
+/// Return the feature flag audit trail (most recent 100 entries).
+#[utoipa::path(
+    get,
+    path = "/v1/admin/feature-flags/audit",
+    tag = "admin",
+    responses(
+        (status = 200, description = "Audit trail"),
+        (status = 401, description = "Unauthorized", body = ErrorResponse),
+    )
+)]
+pub async fn get_feature_flag_audit(State(state): State<AppState>) -> Result<Json<Value>, AppError> {
+    let rows: Vec<(uuid::Uuid, String, String, Option<String>, String, chrono::DateTime<chrono::Utc>)> =
+        sqlx::query_as(
+            "SELECT a.id, f.name, a.action, a.reason, a.triggered_by, a.created_at
+             FROM feature_flag_audit a
+             JOIN feature_flags f ON f.id = a.flag_id
+             ORDER BY a.created_at DESC LIMIT 100",
+        )
+        .fetch_all(&state.pool)
+        .await?;
+
+    let entries: Vec<Value> = rows
+        .into_iter()
+        .map(|(id, flag_name, action, reason, triggered_by, created_at)| {
+            json!({
+                "id": id,
+                "flag_name": flag_name,
+                "action": action,
+                "reason": reason,
+                "triggered_by": triggered_by,
+                "created_at": created_at,
+            })
+        })
+        .collect();
+
+    Ok(Json(json!({ "entries": entries, "count": entries.len() })))
+}

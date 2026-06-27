@@ -423,7 +423,12 @@ pub fn create_router_with_tx_and_tenant_map(
         .route("/admin/notifications/email/ab-test/results", get(handlers::get_ab_test_results))
         // Issue #490: suppression list management (admin)
         .route("/admin/notifications/suppress", axum::routing::post(handlers::add_suppression))
-        .route("/admin/notifications/suppress/{id}", axum::routing::delete(handlers::remove_suppression));
+        .route("/admin/notifications/suppress/{id}", axum::routing::delete(handlers::remove_suppression))
+        // #586: Replica sync monitoring
+        .route("/admin/replication/status", axum::routing::get(handlers::get_replication_status))
+        // #587: Feature flag management
+        .route("/admin/feature-flags", axum::routing::get(handlers::list_feature_flags))
+        .route("/admin/feature-flags/audit", axum::routing::get(handlers::get_feature_flag_audit));
 
 
     // Unversioned deprecated aliases (same handlers, add Deprecation header via middleware)

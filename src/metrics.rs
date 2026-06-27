@@ -218,6 +218,15 @@ pub fn record_replay_job() {
     m::counter!("soroban_pulse_replay_jobs_total").increment(1);
 }
 
+/// Record a feature flag auto-rollback event (#587)
+pub fn record_feature_flag_rollback(flag_name: &str) {
+    m::counter!(
+        "soroban_pulse_feature_flag_rollback_total",
+        "flag_name" => flag_name.to_string()
+    )
+    .increment(1);
+}
+
 /// Record the number of database migrations applied during a run (issue #411)
 pub fn record_migrations_applied(count: u64) {
     m::counter!("soroban_pulse_migrations_applied_total").increment(count);

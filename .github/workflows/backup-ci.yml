@@ -1,0 +1,159 @@
+name: Backup Verification CI
+
+on:
+  schedule:
+    - cron: '0 3 * * *'  # Daily at 03:00 UTC
+  workflow_dispatch:
+
+jobs:
+  backup-restore-test:
+    name: Backup restore integrity test
+    runs-on: ubuntu-latest
+
+    services:
+      source_db:
+        image: postgres:14
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: soroban_pulse_source
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+
+      restore_db:
+        image: postgres:14
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: soroban_pulse_restore
+        ports:
+          - 5433:5432
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+
+    env:
+      SOURCE_URL: postgres://postgres:postgres@localhost:5432/soroban_pulse_source
+      RESTORE_URL: postgres://postgres:postgres@localhost:5433/soroban_pulse_restore
+      BACKUP_DEST: /tmp/backups
+      BACKUP_ENCRYPTION_KEY: ci-test-key-12345
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install dependencies
+        run: sudo apt-get update && sudo apt-get install -y gnupg postgresql-client
+
+      - name: Apply migrations to source DB
+        run: |
+          for f in migrations/*.sql; do
+            psql "$SOURCE_URL" -f "$f" || true
+          done
+
+      - name: Seed source DB
+        run: |
+          psql "$SOURCE_URL" <<'SQL'
+            INSERT INTO events (contract_id, event_type, tx_hash, ledger, timestamp, event_data)
+            SELECT
+              'C' || lpad(i::text, 55, '0'),
+              'contract',
+              lpad(i::text, 64, '0'),
+              i,
+              now(),
+              '{}'::jsonb
+            FROM generate_series(1, 100) AS i;
+          SQL
+
+      - name: Record source checksum
+        run: |
+          CHECKSUM=$(psql "$SOURCE_URL" -t -c \
+            "SELECT md5(string_agg(tx_hash, '' ORDER BY id)) FROM events;" | tr -d ' ')
+          echo "SOURCE_CHECKSUM=$CHECKSUM" >> "$GITHUB_ENV"
+          echo "Source checksum: $CHECKSUM"
+
+      - name: Run encrypted backup
+        run: |
+          START=$(date +%s)
+          DATABASE_URL="$SOURCE_URL" \
+          BACKUP_ENCRYPTION_KEY="$BACKUP_ENCRYPTION_KEY" \
+          BACKUP_DEST="$BACKUP_DEST" \
+          bash scripts/backup.sh
+          END=$(date +%s)
+          echo "BACKUP_DURATION=$((END - START))" >> "$GITHUB_ENV"
+
+      - name: Verify backup file is encrypted
+        run: |
+          BACKUP_FILE=$(ls "$BACKUP_DEST"/*.dump.gpg | head -1)
+          if [ ! -f "$BACKUP_FILE" ]; then
+            echo "ERROR: Encrypted backup file not found"
+            exit 1
+          fi
+          file "$BACKUP_FILE" | grep -q "GPG" && echo "GPG encryption verified"
+          BACKUP_SIZE=$(stat -c%s "$BACKUP_FILE")
+          echo "BACKUP_SIZE=$BACKUP_SIZE" >> "$GITHUB_ENV"
+          echo "Backup size: $BACKUP_SIZE bytes"
+
+      - name: Apply migrations to restore DB
+        run: |
+          for f in migrations/*.sql; do
+            psql "$RESTORE_URL" -f "$f" || true
+          done
+
+      - name: Restore backup
+        run: |
+          BACKUP_FILE=$(ls "$BACKUP_DEST"/*.dump.gpg | head -1)
+          START=$(date +%s)
+          DATABASE_URL="$RESTORE_URL" \
+          BACKUP_ENCRYPTION_KEY="$BACKUP_ENCRYPTION_KEY" \
+          bash scripts/restore.sh "$BACKUP_FILE" <<< "yes"
+          END=$(date +%s)
+          echo "RESTORE_DURATION=$((END - START))" >> "$GITHUB_ENV"
+
+      - name: Verify row counts match
+        run: |
+          SOURCE_COUNT=$(psql "$SOURCE_URL" -t -c "SELECT COUNT(*) FROM events;" | tr -d ' ')
+          RESTORE_COUNT=$(psql "$RESTORE_URL" -t -c "SELECT COUNT(*) FROM events;" | tr -d ' ')
+          if [ "$SOURCE_COUNT" != "$RESTORE_COUNT" ]; then
+            echo "ERROR: Row count mismatch (source=$SOURCE_COUNT, restore=$RESTORE_COUNT)"
+            exit 1
+          fi
+          echo "Row count verified: $SOURCE_COUNT rows"
+
+      - name: Verify data integrity checksum
+        run: |
+          RESTORE_CHECKSUM=$(psql "$RESTORE_URL" -t -c \
+            "SELECT md5(string_agg(tx_hash, '' ORDER BY id)) FROM events;" | tr -d ' ')
+          if [ "$RESTORE_CHECKSUM" != "$SOURCE_CHECKSUM" ]; then
+            echo "ERROR: Checksum mismatch (source=$SOURCE_CHECKSUM, restore=$RESTORE_CHECKSUM)"
+            exit 1
+          fi
+          echo "Data integrity checksum verified"
+
+      - name: Generate backup quality report
+        run: |
+          cat <<EOF
+          ========================================
+          Backup Quality Report
+          ========================================
+          Backup duration:  ${BACKUP_DURATION}s
+          Restore duration: ${RESTORE_DURATION}s
+          Backup size:      ${BACKUP_SIZE} bytes
+          Source checksum:  ${SOURCE_CHECKSUM}
+          Status:           PASSED
+          ========================================
+          EOF
+
+      - name: Upload backup quality report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: backup-quality-report
+          retention-days: 30
+          path: /tmp/backups/
