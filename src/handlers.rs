@@ -10698,6 +10698,268 @@ pub async fn get_timeseries(
     }))
 }
 
+/// Parse a relative time expression such as `"24h"`, `"1d"`, `"30m"`, `"1w"`, `"90s"`.
+/// Returns the equivalent `chrono::Duration` or a validation error.
+fn parse_relative_duration(expr: &str) -> Result<chrono::Duration, AppError> {
+    let expr = expr.trim();
+    if expr.is_empty() {
+        return Err(AppError::Validation(
+            "relative time expression must not be empty".to_string(),
+        ));
+    }
+    let (num_str, unit) = expr
+        .find(|c: char| c.is_alphabetic())
+        .map(|i| (&expr[..i], &expr[i..]))
+        .ok_or_else(|| {
+            AppError::Validation(format!(
+                "invalid relative time expression '{}': missing unit (s/m/h/d/w)",
+                expr
+            ))
+        })?;
+    let n: i64 = num_str.parse().map_err(|_| {
+        AppError::Validation(format!(
+            "invalid relative time expression '{}': '{}' is not a number",
+            expr, num_str
+        ))
+    })?;
+    if n <= 0 {
+        return Err(AppError::Validation(format!(
+            "relative time value must be positive, got '{}'",
+            expr
+        )));
+    }
+    match unit {
+        "s" => Ok(chrono::Duration::seconds(n)),
+        "m" => Ok(chrono::Duration::minutes(n)),
+        "h" => Ok(chrono::Duration::hours(n)),
+        "d" => Ok(chrono::Duration::days(n)),
+        "w" => Ok(chrono::Duration::weeks(n)),
+        other => Err(AppError::Validation(format!(
+            "unknown time unit '{}' in '{}': use s, m, h, d, or w",
+            other, expr
+        ))),
+    }
+}
+
+/// GET /v1/events/temporal — time-based event queries (Issue #581).
+///
+/// Supports relative time expressions (`since=24h`, `before=1h`) and absolute
+/// ISO 8601 timestamps (`from_timestamp`, `to_timestamp`). When `aggregate=true`
+/// the response contains bucketed counts instead of raw events.
+#[utoipa::path(
+    get,
+    path = "/v1/events/temporal",
+    tag = "events",
+    params(
+        ("since" = Option<String>, Query, description = "Relative start of window, e.g. '24h', '1d', '7d', '30m', '1w'"),
+        ("before" = Option<String>, Query, description = "Relative end of window (default: now)"),
+        ("from_timestamp" = Option<String>, Query, description = "Absolute ISO 8601 start timestamp (mutually exclusive with since)"),
+        ("to_timestamp" = Option<String>, Query, description = "Absolute ISO 8601 end timestamp"),
+        ("contract_id" = Option<String>, Query, description = "Filter by contract ID"),
+        ("event_type" = Option<String>, Query, description = "Filter by event type"),
+        ("aggregate" = Option<bool>, Query, description = "Return aggregated bucket counts instead of raw events"),
+        ("window" = Option<String>, Query, description = "Aggregation bucket size: 1m, 5m, 1h, 1d (default: 1h)"),
+        ("limit" = Option<i64>, Query, description = "Max events or buckets (default: 100, max: 1000)"),
+        ("page" = Option<i64>, Query, description = "Page number for offset pagination (default: 1)"),
+    ),
+    responses(
+        (status = 200, description = "Temporal query results", body = models::TemporalQueryResponse),
+        (status = 400, description = "Invalid parameters", body = models::ErrorResponse),
+    )
+)]
+pub async fn get_temporal_events(
+    State(state): State<AppState>,
+    Query(params): Query<models::TemporalParams>,
+) -> Result<Json<models::TemporalQueryResponse>, AppError> {
+    let query_start = std::time::Instant::now();
+    let now = Utc::now();
+
+    // Resolve the time window boundaries.
+    let from: DateTime<Utc> = if let Some(ref since) = params.since {
+        if params.from_timestamp.is_some() {
+            return Err(AppError::Validation(
+                "'since' and 'from_timestamp' are mutually exclusive".to_string(),
+            ));
+        }
+        let dur = parse_relative_duration(since)?;
+        now - dur
+    } else if let Some(ref ts) = params.from_timestamp {
+        validate_timestamp(ts)?
+    } else {
+        return Err(AppError::Validation(
+            "either 'since' or 'from_timestamp' is required".to_string(),
+        ));
+    };
+
+    let to: DateTime<Utc> = if let Some(ref before) = params.before {
+        if params.to_timestamp.is_some() {
+            return Err(AppError::Validation(
+                "'before' and 'to_timestamp' are mutually exclusive".to_string(),
+            ));
+        }
+        let dur = parse_relative_duration(before)?;
+        now - dur
+    } else if let Some(ref ts) = params.to_timestamp {
+        validate_timestamp(ts)?
+    } else {
+        now
+    };
+
+    if from >= to {
+        return Err(AppError::Validation(
+            "start of window must be before end of window".to_string(),
+        ));
+    }
+
+    if let Some(ref cid) = params.contract_id {
+        validate_contract_id(cid)?;
+    }
+
+    let limit = params.limit.unwrap_or(100).clamp(1, 1000);
+    let page = params.page.unwrap_or(1).max(1);
+    let offset = (page - 1) * limit;
+
+    let aggregate = params.aggregate.unwrap_or(false);
+
+    if aggregate {
+        // Aggregation path: return bucketed event counts.
+        let interval = match params.window.as_deref().unwrap_or("1h") {
+            "1m" => "1 minute",
+            "5m" => "5 minutes",
+            "1h" => "1 hour",
+            "1d" => "1 day",
+            other => {
+                return Err(AppError::Validation(format!(
+                    "invalid window '{}': use 1m, 5m, 1h, or 1d",
+                    other
+                )));
+            }
+        };
+
+        let mut conditions = vec![
+            "timestamp >= $1".to_string(),
+            "timestamp <= $2".to_string(),
+        ];
+        let mut bind_idx = 3usize;
+
+        if params.contract_id.is_some() {
+            conditions.push(format!("contract_id = ${bind_idx}"));
+            bind_idx += 1;
+        }
+        if params.event_type.is_some() {
+            conditions.push(format!("event_type = ${bind_idx}"));
+            bind_idx += 1;
+        }
+        let _ = bind_idx;
+
+        let where_clause = conditions.join(" AND ");
+        let query_str = format!(
+            "SELECT \
+                date_trunc('{interval}', timestamp) AS bucket_start, \
+                COUNT(*) AS event_count, \
+                COUNT(DISTINCT contract_id) AS contract_count \
+             FROM events \
+             WHERE {where_clause} \
+             GROUP BY date_trunc('{interval}', timestamp) \
+             ORDER BY bucket_start ASC \
+             LIMIT {limit} OFFSET {offset}",
+            interval = interval,
+            where_clause = where_clause,
+            limit = limit,
+            offset = offset,
+        );
+
+        let mut q = sqlx::query(&query_str).bind(from).bind(to);
+        if let Some(ref cid) = params.contract_id {
+            q = q.bind(cid);
+        }
+        if let Some(ref et) = params.event_type {
+            q = q.bind(et);
+        }
+
+        let rows = q.fetch_all(&state.read_pool).await?;
+
+        let mut buckets = Vec::with_capacity(rows.len());
+        for row in &rows {
+            let bucket_start: DateTime<Utc> = row.try_get("bucket_start")?;
+            let event_count: i64 = row.try_get("event_count")?;
+            let contract_count: i64 = row.try_get("contract_count")?;
+            buckets.push(models::TemporalBucket {
+                bucket_start,
+                event_count,
+                contract_count,
+            });
+        }
+
+        let total = buckets.len();
+        crate::metrics::record_temporal_query_duration(query_start.elapsed());
+
+        Ok(Json(models::TemporalQueryResponse {
+            from,
+            to,
+            events: vec![],
+            buckets,
+            total,
+        }))
+    } else {
+        // Raw events path.
+        let mut conditions = vec![
+            "timestamp >= $1".to_string(),
+            "timestamp <= $2".to_string(),
+        ];
+        let mut bind_idx = 3usize;
+
+        if params.contract_id.is_some() {
+            conditions.push(format!("contract_id = ${bind_idx}"));
+            bind_idx += 1;
+        }
+        if params.event_type.is_some() {
+            conditions.push(format!("event_type = ${bind_idx}"));
+            bind_idx += 1;
+        }
+        let _ = bind_idx;
+
+        let where_clause = conditions.join(" AND ");
+        let query_str = format!(
+            "SELECT id, contract_id, event_type, tx_hash, ledger, timestamp, \
+                    event_data, event_data_normalized, event_data_decoded, \
+                    ledger_hash, in_successful_call, created_at, \
+                    schema_version, anonymized, fingerprint, \
+                    0::bigint AS total_count \
+             FROM events \
+             WHERE {where_clause} \
+             ORDER BY timestamp DESC \
+             LIMIT {limit} OFFSET {offset}",
+            where_clause = where_clause,
+            limit = limit,
+            offset = offset,
+        );
+
+        let mut q = sqlx::query_as::<_, models::Event>(&query_str)
+            .bind(from)
+            .bind(to);
+        if let Some(ref cid) = params.contract_id {
+            q = q.bind(cid);
+        }
+        if let Some(ref et) = params.event_type {
+            q = q.bind(et);
+        }
+
+        let events = q.fetch_all(&state.read_pool).await?;
+        let total = events.len();
+
+        crate::metrics::record_temporal_query_duration(query_start.elapsed());
+
+        Ok(Json(models::TemporalQueryResponse {
+            from,
+            to,
+            events,
+            buckets: vec![],
+            total,
+        }))
+    }
+}
+
 /// WebSocket endpoint for event streaming (alternative to SSE)
 #[utoipa::path(
     get,
@@ -11121,4 +11383,230 @@ pub async fn get_feature_flag_audit(State(state): State<AppState>) -> Result<Jso
 
     let count = entries.len();
     Ok(Json(json!({ "entries": entries, "count": count })))
+#[cfg(test)]
+mod temporal_tests {
+    use super::*;
+    use crate::config::{HealthState, IndexerState};
+    use axum::body::{to_bytes, Body};
+    use axum::http::{Request, StatusCode};
+    use sqlx::PgPool;
+    use std::sync::Arc;
+    use tower::ServiceExt;
+
+    fn create_test_router(pool: PgPool) -> axum::Router {
+        let health_state = Arc::new(HealthState::new(60));
+        let indexer_state = Arc::new(IndexerState::new());
+        let prometheus_handle = crate::metrics::init_metrics();
+        let config = crate::config::Config::default();
+        crate::routes::create_router(
+            pool,
+            Vec::new(),
+            &[],
+            60,
+            health_state,
+            indexer_state,
+            prometheus_handle,
+            2000,
+            config,
+        )
+    }
+
+    // ── parse_relative_duration unit tests ────────────────────────────────────
+
+    #[test]
+    fn parse_seconds() {
+        let d = parse_relative_duration("30s").unwrap();
+        assert_eq!(d, chrono::Duration::seconds(30));
+    }
+
+    #[test]
+    fn parse_minutes() {
+        let d = parse_relative_duration("5m").unwrap();
+        assert_eq!(d, chrono::Duration::minutes(5));
+    }
+
+    #[test]
+    fn parse_hours() {
+        let d = parse_relative_duration("24h").unwrap();
+        assert_eq!(d, chrono::Duration::hours(24));
+    }
+
+    #[test]
+    fn parse_days() {
+        let d = parse_relative_duration("7d").unwrap();
+        assert_eq!(d, chrono::Duration::days(7));
+    }
+
+    #[test]
+    fn parse_weeks() {
+        let d = parse_relative_duration("2w").unwrap();
+        assert_eq!(d, chrono::Duration::weeks(2));
+    }
+
+    #[test]
+    fn parse_invalid_unit_returns_error() {
+        assert!(parse_relative_duration("1y").is_err());
+    }
+
+    #[test]
+    fn parse_missing_unit_returns_error() {
+        assert!(parse_relative_duration("42").is_err());
+    }
+
+    #[test]
+    fn parse_zero_returns_error() {
+        assert!(parse_relative_duration("0h").is_err());
+    }
+
+    #[test]
+    fn parse_negative_returns_error() {
+        assert!(parse_relative_duration("-1h").is_err());
+    }
+
+    #[test]
+    fn parse_empty_returns_error() {
+        assert!(parse_relative_duration("").is_err());
+    }
+
+    // ── /v1/events/temporal integration tests ─────────────────────────────────
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn temporal_missing_since_and_from_returns_400(pool: PgPool) {
+        let app = create_test_router(pool);
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .uri("/v1/events/temporal")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn temporal_since_24h_returns_200_empty(pool: PgPool) {
+        let app = create_test_router(pool);
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .uri("/v1/events/temporal?since=24h")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(v["events"], serde_json::json!([]));
+        assert_eq!(v["total"], 0);
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn temporal_aggregate_returns_buckets(pool: PgPool) {
+        let app = create_test_router(pool);
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .uri("/v1/events/temporal?since=1d&aggregate=true&window=1h")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        // On an empty DB the buckets array should be empty (no events in last 24h)
+        assert!(v["buckets"].is_array());
+        assert!(v["events"].is_array());
+        assert_eq!(v["events"], serde_json::json!([]));
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn temporal_since_and_from_timestamp_mutually_exclusive(pool: PgPool) {
+        let app = create_test_router(pool);
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .uri("/v1/events/temporal?since=1d&from_timestamp=2026-01-01T00:00:00Z")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn temporal_invalid_window_returns_400(pool: PgPool) {
+        let app = create_test_router(pool);
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .uri("/v1/events/temporal?since=1d&aggregate=true&window=2d")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn temporal_returns_event_within_window(pool: PgPool) {
+        // Insert an event that was created just now (well within 24h window).
+        sqlx::query(
+            "INSERT INTO events (contract_id, event_type, tx_hash, ledger, timestamp, event_data)
+             VALUES ('CABC', 'contract', 'txabc123temporal', 100, NOW(), '{}'::jsonb)",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let app = create_test_router(pool);
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .uri("/v1/events/temporal?since=24h")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(v["total"], 1);
+        assert_eq!(v["events"].as_array().unwrap().len(), 1);
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn temporal_event_outside_window_not_returned(pool: PgPool) {
+        // Insert an event two days ago — outside the 1h window.
+        sqlx::query(
+            "INSERT INTO events (contract_id, event_type, tx_hash, ledger, timestamp, event_data)
+             VALUES ('CABC', 'contract', 'txold_temporal', 99, NOW() - INTERVAL '2 days', '{}'::jsonb)",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let app = create_test_router(pool);
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .uri("/v1/events/temporal?since=1h")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(v["total"], 0);
+    }
 }

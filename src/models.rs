@@ -140,6 +140,9 @@ pub struct Event {
     /// Whether this event has been anonymized for GDPR compliance.
     #[sqlx(default)]
     pub anonymized: bool,
+    /// SHA-256 content fingerprint for cross-retry deduplication (Issue #582).
+    #[sqlx(default)]
+    pub fingerprint: Option<String>,
     #[sqlx(default)]
     #[serde(skip)]
     pub total_count: i64,
@@ -366,6 +369,62 @@ pub struct TimeseriesResponse {
     pub bucket: String,
     /// Array of time buckets
     pub data: Vec<TimeseriesBucket>,
+}
+
+/// Query parameters for GET /v1/events/temporal (Issue #581).
+#[derive(Debug, Deserialize, utoipa::ToSchema)]
+pub struct TemporalParams {
+    /// Relative time expression for the start of the window.
+    /// Supported units: `s` (seconds), `m` (minutes), `h` (hours), `d` (days), `w` (weeks).
+    /// Examples: `"24h"`, `"1d"`, `"7d"`, `"30m"`, `"1w"`.
+    /// Mutually exclusive with `from_timestamp`.
+    pub since: Option<String>,
+    /// Relative time expression for the end of the window (default: now).
+    /// Uses the same format as `since`.
+    pub before: Option<String>,
+    /// Absolute ISO 8601 start timestamp. Mutually exclusive with `since`.
+    pub from_timestamp: Option<String>,
+    /// Absolute ISO 8601 end timestamp.
+    pub to_timestamp: Option<String>,
+    /// Filter by contract ID.
+    pub contract_id: Option<String>,
+    /// Filter by event type.
+    pub event_type: Option<EventType>,
+    /// When `true`, return aggregated counts per `window` bucket instead of raw events.
+    pub aggregate: Option<bool>,
+    /// Aggregation bucket size: `"1m"`, `"5m"`, `"1h"`, `"1d"` (default: `"1h"`).
+    /// Only used when `aggregate = true`.
+    pub window: Option<String>,
+    /// Maximum number of events or buckets to return (default: 100, max: 1000).
+    pub limit: Option<i64>,
+    /// Page number for offset-based pagination (default: 1).
+    pub page: Option<i64>,
+}
+
+/// One aggregation bucket in a temporal aggregation response.
+#[derive(Debug, Serialize, utoipa::ToSchema)]
+pub struct TemporalBucket {
+    /// Start of the bucket (ISO 8601).
+    pub bucket_start: DateTime<Utc>,
+    /// Number of events in the bucket.
+    pub event_count: i64,
+    /// Number of unique contracts contributing events.
+    pub contract_count: i64,
+}
+
+/// Response body for GET /v1/events/temporal.
+#[derive(Debug, Serialize, utoipa::ToSchema)]
+pub struct TemporalQueryResponse {
+    /// Resolved start of the queried window (ISO 8601).
+    pub from: DateTime<Utc>,
+    /// Resolved end of the queried window (ISO 8601).
+    pub to: DateTime<Utc>,
+    /// Raw events (populated when `aggregate = false`).
+    pub events: Vec<Event>,
+    /// Aggregated buckets (populated when `aggregate = true`).
+    pub buckets: Vec<TemporalBucket>,
+    /// Total number of results (events or buckets).
+    pub total: usize,
 }
 
 /// Webhook configuration for formatted notifications

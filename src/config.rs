@@ -242,6 +242,13 @@ pub struct Config {
     // Issue #266: Bloom filter deduplication
     pub bloom_filter_fp_rate: f64,
     pub bloom_filter_capacity: usize,
+    // Issue #582: Content-fingerprint deduplication across retries
+    /// When true, a SHA-256 fingerprint of each event's content is computed and
+    /// checked against recent DB rows before inserting. Prevents storing
+    /// content-identical events that arrive with a different tx_hash on retry.
+    pub enable_content_dedup: bool,
+    /// Lookback window for fingerprint dedup checks (seconds). Default: 3600 (1 hour).
+    pub dedup_window_secs: u64,
     // Issue #265: AWS Kinesis streaming
     pub kinesis_stream_name: Option<String>,
     pub aws_region: Option<String>,
@@ -407,6 +414,8 @@ impl Default for Config {
             tls_key_file: None,
             bloom_filter_fp_rate: 0.001,
             bloom_filter_capacity: 1_000_000,
+            enable_content_dedup: false,
+            dedup_window_secs: 3600,
             kinesis_stream_name: None,
             aws_region: None,
             pubsub_project_id: None,
@@ -1197,6 +1206,12 @@ impl Config {
             bloom_filter_capacity: env_or_file_or("BLOOM_FILTER_CAPACITY", &file, "1000000")
                 .parse()
                 .unwrap_or(1_000_000),
+            enable_content_dedup: env_or_file("ENABLE_CONTENT_DEDUP", &file)
+                .map(|v| matches!(v.to_ascii_lowercase().as_str(), "true" | "1" | "yes" | "y"))
+                .unwrap_or(false),
+            dedup_window_secs: env_or_file_or("DEDUP_WINDOW_SECS", &file, "3600")
+                .parse()
+                .unwrap_or(3600),
             kinesis_stream_name: env::var("KINESIS_STREAM_NAME")
                 .ok()
                 .filter(|s| !s.is_empty()),

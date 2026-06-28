@@ -279,6 +279,24 @@ pub fn record_timeseries_query_duration(duration: std::time::Duration) {
         .record(duration.as_secs_f64());
 }
 
+/// Record temporal query duration (Issue #581)
+pub fn record_temporal_query_duration(duration: std::time::Duration) {
+    m::histogram!("soroban_pulse_temporal_query_duration_seconds")
+        .record(duration.as_secs_f64());
+}
+
+/// Record a content-fingerprint deduplication hit (Issue #582).
+/// Incremented when an event is skipped because its fingerprint matches a
+/// recently stored event, indicating a content-identical retry.
+pub fn record_content_dedup_hit() {
+    m::counter!("soroban_pulse_content_dedup_hits_total").increment(1);
+}
+
+/// Record that an event fingerprint was computed and stored (Issue #582).
+pub fn record_fingerprint_stored() {
+    m::counter!("soroban_pulse_fingerprints_stored_total").increment(1);
+}
+
 /// Record contract history query duration
 pub fn record_contract_history_query_duration(duration: std::time::Duration) {
     m::histogram!("soroban_pulse_contract_history_query_duration_seconds")

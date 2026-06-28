@@ -368,6 +368,7 @@ pub fn create_router_with_tx_and_tenant_map(
         .route("/events/diff", get(handlers::get_events_diff))
         .route("/events/export", get(handlers::export_events))
         .route("/events/timeseries", get(handlers::get_timeseries))
+        .route("/events/temporal", get(handlers::get_temporal_events))
         .route("/events/recent", get(handlers::get_recent_events))
         .route("/events/stream", get(handlers::stream_events))
         .route("/events/stream/multi", get(handlers::stream_events_multi))

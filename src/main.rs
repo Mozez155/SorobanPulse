@@ -10,6 +10,7 @@ mod bloom_filter;
 mod config;
 mod content_filter;
 mod db;
+mod dedup;
 mod email;
 mod encryption;
 mod error;

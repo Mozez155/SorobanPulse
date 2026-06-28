@@ -1068,6 +1068,36 @@ impl<R: RpcClient> Indexer<R> {
             .map_err(|_| anyhow::anyhow!("Unparseable ledger_closed_at"))?;
         let event_data = json!({ "value": event.value, "topic": event.topic });
 
+        // Issue #582: Compute content fingerprint for cross-retry deduplication.
+        let fingerprint = crate::dedup::compute_fingerprint(
+            &event.tx_hash,
+            &event.contract_id,
+            &event.event_type,
+            &event_data,
+        );
+
+        // Issue #582: Content-fingerprint dedup check (secondary guard, optional).
+        // The primary guard is the DB unique constraint on (tx_hash, contract_id, event_type).
+        if self.config.enable_content_dedup {
+            match crate::dedup::is_content_duplicate(
+                &self.pool,
+                &fingerprint,
+                self.config.dedup_window_secs,
+            )
+            .await
+            {
+                Ok(true) => {
+                    metrics::record_content_dedup_hit();
+                    return Ok(0);
+                }
+                Ok(false) => {}
+                Err(e) => {
+                    // Non-fatal: log and continue; the DB constraint is the authoritative guard.
+                    tracing::warn!(error = %e, "Fingerprint dedup check failed, proceeding with insert");
+                }
+            }
+        }
+
         // Look up ABI for this contract and decode event_data if available.
         let event_data_decoded =
             crate::abi::decode_event_with_registered_abi(&self.pool, &event.contract_id, &event_data).await;
@@ -1093,8 +1123,8 @@ impl<R: RpcClient> Indexer<R> {
         };
 
         let result = sqlx::query(
-            r#"INSERT INTO events (contract_id, event_type, tx_hash, ledger, timestamp, event_data, ledger_hash, in_successful_call, event_data_decoded, tenant_id)
-               VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+            r#"INSERT INTO events (contract_id, event_type, tx_hash, ledger, timestamp, event_data, ledger_hash, in_successful_call, event_data_decoded, tenant_id, fingerprint)
+               VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
                ON CONFLICT (tx_hash, contract_id, event_type) DO NOTHING"#,
         )
         .bind(&event.contract_id)
@@ -1102,16 +1132,18 @@ impl<R: RpcClient> Indexer<R> {
         .bind(&event.tx_hash)
         .bind(ledger)
         .bind(timestamp)
-        .bind(event_data)
+        .bind(&event_data)
         .bind(&event.ledger_hash)
         .bind(event.in_successful_call)
         .bind(event_data_decoded)
         .bind(tenant_id)
+        .bind(&fingerprint)
         .execute(&mut **tx)
         .await?;
 
         let rows = result.rows_affected();
         if rows > 0 {
+            metrics::record_fingerprint_stored();
             // Record in bloom filter after successful insert
             if let Some(ref bloom) = self.bloom_filter {
                 bloom.set(&event.tx_hash, &event.contract_id, &event.event_type);
